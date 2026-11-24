@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rustygrade
+GenericName=Music Player
+Comment=Local music player with gapless playback, equalizer and synced lyrics
+Exec=@EXEC@ %F
+Icon=rustygrade
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+MimeType=audio/flac;audio/mpeg;audio/ogg;audio/opus;audio/x-wav;audio/mp4;audio/aac;
+StartupWMClass=rustygrade
+Keywords=music;audio;player;flac;mpv;

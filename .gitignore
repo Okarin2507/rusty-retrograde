@@ -1,0 +1,21 @@
+# Rust build output
+/target
+**/*.rs.bk
+dist/
+
+# Logs
+*.log
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.sw?
+
+# Local-only files
+docs/
+.github/
+.claude/
+CLAUDE.md
+AGENTS.md

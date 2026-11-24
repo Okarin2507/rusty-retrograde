@@ -1,0 +1,26 @@
+[package]
+name = "rustygrade-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustygrade"
+path = "src/main.rs"
+
+[features]
+default = ["pipewire-bridge", "tray", "portal"]
+pipewire-bridge = ["rustygrade-audio/pipewire-bridge"]
+tray = ["rustygrade-linux/tray"]
+portal = ["rustygrade-linux/portal"]
+
+[dependencies]
+rustygrade-core.workspace = true
+rustygrade-audio.workspace = true
+rustygrade-linux.workspace = true
+iced.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+image.workspace = true
