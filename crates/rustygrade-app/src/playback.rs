@@ -1,10 +1,13 @@
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::FRAC_PI_2;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs::File;
+use std::hash::{BuildHasher, Hasher};
+use std::io::Read;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustygrade_core::{Album, PlayStats, SessionState, Track};
+use rustygrade_core::{PlayStats, SessionState, Track};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RepeatMode {
@@ -43,6 +46,17 @@ impl RepeatMode {
         }
     }
 
+    pub fn icon_name(self) -> &'static str {
+        match self {
+            Self::One => "repeat1",
+            Self::Off | Self::All => "repeat",
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        self != Self::Off
+    }
+
     pub fn mpris_loop_status(self) -> &'static str {
         match self {
             Self::Off => "None",
@@ -60,37 +74,83 @@ impl RepeatMode {
     }
 }
 
-static SHUFFLE_NONCE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+struct SplitMix64 {
+    state: u64,
+}
 
-fn next_rand_u64() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x517c_c1b7_2722_0a95);
-    let mut x = SHUFFLE_NONCE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed) ^ nanos;
-    if x == 0 {
-        x = 0xdead_beef_cafe_babe;
+impl SplitMix64 {
+    fn from_os_entropy() -> Self {
+        let mut buf = [0_u8; 8];
+        let mut seed = if let Ok(mut f) = File::open("/dev/urandom")
+            && f.read_exact(&mut buf).is_ok()
+        {
+            u64::from_le_bytes(buf)
+        } else {
+            0
+        };
+        if seed == 0 {
+            let mut hasher = RandomState::new().build_hasher();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            hasher.write_u64(nanos);
+            hasher.write_usize(buf.as_ptr() as usize);
+            seed = hasher.finish();
+        }
+        if seed == 0 {
+            seed = 0x9e37_79b9_7f4a_7c15;
+        }
+        Self { state: seed }
     }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    x
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn next_usize(&mut self, bound: usize) -> usize {
+        debug_assert!(bound > 0);
+        if bound <= 1 {
+            return 0;
+        }
+        let bound_u64 = bound as u64;
+        let limit = u64::MAX - (u64::MAX % bound_u64);
+        loop {
+            let v = self.next_u64();
+            if v < limit {
+                return (v % bound_u64) as usize;
+            }
+        }
+    }
+}
+
+static SHUFFLE_RNG: LazyLock<Mutex<SplitMix64>> =
+    LazyLock::new(|| Mutex::new(SplitMix64::from_os_entropy()));
+
+fn next_rand_usize(bound: usize) -> usize {
+    match SHUFFLE_RNG.lock() {
+        Ok(mut rng) => rng.next_usize(bound),
+        Err(poisoned) => poisoned.into_inner().next_usize(bound),
+    }
 }
 
 fn shuffle_slice<T>(slice: &mut [T]) {
     let n = slice.len();
     for i in (1..n).rev() {
-        let j = (next_rand_u64() as usize) % (i + 1);
+        let j = next_rand_usize(i + 1);
         slice.swap(i, j);
     }
 }
 
-/// The play queue, mirroring C# `PlayerViewModel` (+ `.Shuffle.cs`).
+/// The play queue.
 ///
 /// `tracks` is the play order: what follows the current track is what plays next, in shuffle too.
-/// Shuffle plays the whole library: turning it on keeps the current track first and puts every other
-/// library track behind it in random order; turning it off goes back to the queue from before
-/// (usually the album), at the current track.
+/// Shuffle stays scoped to the current album or playlist: turning it on keeps the current track
+/// first and shuffles the remaining tracks in the queue randomly; turning it off restores the
+/// unshuffled queue order at the current track.
 ///
 /// Tracks queued by hand form a line right after the current track: ADD_TO_QUEUE joins the end of
 /// that line, PLAY_NEXT goes to its front. The line plays before the rest of the queue.
@@ -119,10 +179,6 @@ pub struct PlaybackQueue {
     repeat: RepeatMode,
     /// How many of the tracks right after the current one were queued by hand.
     hand: usize,
-}
-
-fn library_tracks(library: &[Album]) -> impl Iterator<Item = &Track> {
-    library.iter().flat_map(|a| a.tracks.iter())
 }
 
 impl PlaybackQueue {
@@ -183,9 +239,13 @@ impl PlaybackQueue {
         }
     }
 
-    /// A new current track (C# `NoteTrackChange`): moving on to the next track in order uses up one
-    /// hand-queued track; a jump anywhere else ends the line (what it skipped stays as ordinary tracks).
+    /// A new current track: moving on to the next track in order uses up one hand-queued track;
+    /// repeating the current track (`new_index == index`) preserves the hand-queued line; a jump
+    /// anywhere else ends the line (what it skipped stays as ordinary tracks).
     fn note_track_change(&mut self, new_index: usize) {
+        if self.index == Some(new_index) {
+            return;
+        }
         let in_order = self.index.is_some_and(|i| i + 1 == new_index);
         self.hand = if in_order { self.hand.saturating_sub(1) } else { 0 };
     }
@@ -195,20 +255,26 @@ impl PlaybackQueue {
         self.index = Some(new_index);
     }
 
-    /// C# `PlayQueue`: in shuffle, the chosen track first and the rest of the library after it.
-    pub fn set_queue(&mut self, tracks: Vec<Track>, start_index: usize, library: &[Album]) {
+    /// Sets the active queue from an album or playlist. When shuffle is enabled:
+    /// - `Some(idx)` keeps that track first and shuffles the remaining tracks in `tracks`.
+    /// - `None` shuffles all tracks in `tracks` and starts from a random track at index `0`.
+    pub fn set_queue(&mut self, tracks: Vec<Track>, start_index: Option<usize>) {
         if tracks.is_empty() {
             self.clear();
             return;
         }
-        self.index = Some(start_index.min(tracks.len() - 1));
-        self.tracks = Arc::new(tracks);
-        self.unshuffled = None;
         self.hand = 0;
         if self.shuffle {
-            self.unshuffled = Some(self.tracks.to_vec());
-            self.spread_over_library(library);
+            self.unshuffled = Some(tracks.clone());
+            self.tracks = Arc::new(tracks);
+            self.index = start_index.map(|i| i.min(self.tracks.len() - 1));
             self.build_order();
+            self.index = Some(0);
+        } else {
+            let idx = start_index.unwrap_or(0).min(tracks.len() - 1);
+            self.tracks = Arc::new(tracks);
+            self.index = Some(idx);
+            self.unshuffled = None;
         }
     }
 
@@ -250,13 +316,12 @@ impl PlaybackQueue {
         Some(idx)
     }
 
-    pub fn toggle_shuffle(&mut self, library: &[Album]) -> bool {
-        self.set_shuffle(!self.shuffle, library);
+    pub fn toggle_shuffle(&mut self) -> bool {
+        self.set_shuffle(!self.shuffle);
         self.shuffle
     }
 
-    /// C# `OnIsShuffleChanged`.
-    pub fn set_shuffle(&mut self, enabled: bool, library: &[Album]) {
+    pub fn set_shuffle(&mut self, enabled: bool) {
         if self.shuffle == enabled {
             return;
         }
@@ -267,36 +332,14 @@ impl PlaybackQueue {
                 return;
             }
             self.unshuffled = Some(self.tracks.to_vec());
-            self.spread_over_library(library);
             self.build_order();
         } else {
-            self.return_from_library(library);
+            self.restore_unshuffled();
         }
     }
 
-    /// C# `SpreadOverLibrary`: the current track first, then every other library track, then queued
-    /// tracks the library lacks. Nothing playing or an empty library: the queue stays as it is.
-    fn spread_over_library(&mut self, library: &[Album]) {
-        let Some(current) = self.current().cloned() else {
-            return;
-        };
-        if library_tracks(library).next().is_none() {
-            return;
-        }
-        let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(current.id.clone());
-        let mut list = vec![current];
-        for t in library_tracks(library).chain(self.tracks.iter()) {
-            if seen.insert(t.id.clone()) {
-                list.push(t.clone());
-            }
-        }
-        self.tracks = Arc::new(list);
-        self.index = Some(0);
-    }
-
-    /// C# `BuildOrder`: a fresh round, the current track first and every other track once in
-    /// random order.
+    /// Builds a fresh round within the current queue: the current track stays first when known,
+    /// and every other track in the queue follows in random order.
     fn build_order(&mut self) {
         match self.index {
             Some(cur) if cur < self.tracks.len() => {
@@ -310,44 +353,25 @@ impl PlaybackQueue {
         }
     }
 
-    /// C# `ReturnFromLibrary`: back to the queue from before shuffle, at the track now playing.
-    fn return_from_library(&mut self, library: &[Album]) {
-        let back = self.unshuffled.take();
-        let Some(current) = self.current().cloned() else {
-            if let Some(back) = back {
-                self.tracks = Arc::new(back);
-                self.index = None;
-            }
+    /// Restores the queue from before shuffle, at the track now playing.
+    fn restore_unshuffled(&mut self) {
+        let Some(back) = self.unshuffled.take() else {
             return;
         };
-        if back.is_none() {
-            // After a restart the queue from before is not known. A queue as big as the library is
-            // the shuffle one: go to the current track's album. A smaller one was the user's own: keep it.
-            if self.tracks.len() < library_tracks(library).count() {
-                return;
-            }
-        }
-        let mut idx = back
-            .as_ref()
-            .and_then(|b| b.iter().position(|t| t.id == current.id));
-        let mut back = back;
-        if idx.is_none()
-            && let Some(album) = library
-                .iter()
-                .find(|a| a.tracks.iter().any(|t| t.id == current.id))
-        {
-            idx = album.tracks.iter().position(|t| t.id == current.id);
-            back = Some(album.tracks.clone());
-        }
-        match (back, idx) {
-            (Some(back), Some(idx)) => {
-                self.tracks = Arc::new(back);
-                self.index = Some(idx);
-            }
-            _ => {
-                self.tracks = Arc::new(vec![current]);
-                self.index = Some(0);
-            }
+        let Some(current) = self.current().cloned() else {
+            self.tracks = Arc::new(back);
+            self.index = None;
+            return;
+        };
+        if let Some(idx) = back.iter().position(|t| t.id == current.id) {
+            self.tracks = Arc::new(back);
+            self.index = Some(idx);
+        } else {
+            let mut list = Vec::with_capacity(back.len() + 1);
+            list.push(current);
+            list.extend(back);
+            self.tracks = Arc::new(list);
+            self.index = Some(0);
         }
     }
 
@@ -471,23 +495,23 @@ impl PlaybackQueue {
 
     /// PLAY_NEXT: right after the current track, ahead of the tracks queued before. Returns `true`
     /// when nothing was queued and this started a new queue (the caller starts playback).
-    pub fn play_next(&mut self, tracks: Vec<Track>, library: &[Album]) -> bool {
-        self.enqueue_by_hand(tracks, true, library)
+    pub fn play_next(&mut self, tracks: Vec<Track>) -> bool {
+        self.enqueue_by_hand(tracks, true)
     }
 
     /// ADD_TO_QUEUE: after the current track and the tracks queued by hand before it, without
     /// interrupting playback. Returns `true` when this started a new queue.
-    pub fn enqueue(&mut self, tracks: Vec<Track>, library: &[Album]) -> bool {
-        self.enqueue_by_hand(tracks, false, library)
+    pub fn enqueue(&mut self, tracks: Vec<Track>) -> bool {
+        self.enqueue_by_hand(tracks, false)
     }
 
-    fn enqueue_by_hand(&mut self, list: Vec<Track>, at_front: bool, library: &[Album]) -> bool {
+    fn enqueue_by_hand(&mut self, list: Vec<Track>, at_front: bool) -> bool {
         if list.is_empty() {
             return false;
         }
         let Some(cur) = self.index.filter(|&i| i < self.tracks.len()) else {
             // Nothing queued: start playing, as addToQueue does in the Electron build.
-            self.set_queue(list, 0, library);
+            self.set_queue(list, Some(0));
             return true;
         };
         let upcoming = self.tracks.len() - cur - 1;
@@ -617,7 +641,7 @@ impl PlaybackQueue {
         (true, false)
     }
 
-    pub fn refresh_from_library(&mut self, track_index: &HashMap<String, (Track, Album)>) {
+    pub fn refresh_from_library(&mut self, track_index: &HashMap<String, (Track, rustygrade_core::Album)>) {
         let fresh = |t: &mut Track| {
             if let Some((f, _)) = track_index.get(&t.id) {
                 *t = f.clone();
@@ -629,11 +653,11 @@ impl PlaybackQueue {
         }
     }
 
-    /// Restores a saved queue. A shuffled one is the library-wide queue already, so it is not spread
-    /// again; the queue from before comes from `original_queue_ids` when it was saved.
+    /// Restores a saved queue. A shuffled queue keeps its saved order; the queue from before
+    /// comes from `original_queue_ids` when it was saved.
     pub fn restore_session(
         &mut self,
-        track_index: &HashMap<String, (Track, Album)>,
+        track_index: &HashMap<String, (Track, rustygrade_core::Album)>,
         state: &SessionState,
         queue_ids: &[String],
         original_queue_ids: Option<&[String]>,
@@ -787,6 +811,7 @@ impl CrossfadeMath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustygrade_core::Album;
     use std::path::PathBuf;
 
     fn mk_track(id: &str, album: &str, duration: f64) -> Track {
@@ -838,119 +863,173 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_without_library_keeps_queue_and_restores_order() {
+    fn shuffle_stays_within_current_queue_and_restores_order() {
         let mut q = PlaybackQueue::default();
-        let tracks = (1..=8)
+        let tracks: Vec<Track> = (1..=20)
             .map(|i| mk_track(&format!("/m/{i}.flac"), "Album", 200.0))
             .collect();
-        q.set_queue(tracks, 3, &[]);
+        let original_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+        q.set_queue(tracks, Some(3));
         assert_eq!(q.current().unwrap().id, "/m/4.flac");
 
-        q.set_shuffle(true, &[]);
+        q.set_shuffle(true);
         assert_eq!(q.index(), Some(0));
         assert_eq!(q.current().unwrap().id, "/m/4.flac");
-        assert_eq!(q.tracks().len(), 8);
+        assert_eq!(q.tracks().len(), 20);
+        // Same exact track set (never expands to other albums) and genuinely reordered.
+        let mut sorted_shuffled: Vec<String> = ids(&q).into_iter().map(str::to_owned).collect();
+        let mut sorted_original = original_ids.clone();
+        sorted_shuffled.sort();
+        sorted_original.sort();
+        assert_eq!(sorted_shuffled, sorted_original);
+        let after_first: Vec<&str> = ids(&q)[1..].to_vec();
+        let orig_without_4: Vec<&str> = original_ids
+            .iter()
+            .filter(|id| id.as_str() != "/m/4.flac")
+            .map(String::as_str)
+            .collect();
+        assert_ne!(after_first, orig_without_4);
 
-        q.set_shuffle(false, &[]);
+        q.set_shuffle(false);
         assert_eq!(q.index(), Some(3));
         assert_eq!(q.current().unwrap().id, "/m/4.flac");
-        let expected: Vec<String> = (1..=8).map(|i| format!("/m/{i}.flac")).collect();
-        assert_eq!(ids(&q), expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&q),
+            original_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn shuffle_spreads_over_whole_library_and_off_returns_to_album() {
-        let lib = library();
-        let mut q = PlaybackQueue::default();
-        q.set_queue(lib[0].tracks.clone(), 1, &lib);
-        assert_eq!(q.current().unwrap().id, "/a/2");
+    fn play_album_or_playlist_in_shuffle_with_pinned_track_vs_random_start() {
+        let tracks: Vec<Track> = (1..=12)
+            .map(|i| mk_track(&format!("/p/{i}.flac"), "Playlist", 200.0))
+            .collect();
+        let expected_sorted: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
 
-        q.set_shuffle(true, &lib);
+        // Specific track clicked while shuffle is ON: pinned track plays first, only this list is shuffled.
+        let mut q = PlaybackQueue::default();
+        q.set_shuffle(true);
+        q.set_queue(tracks.clone(), Some(2));
         assert_eq!(q.index(), Some(0));
-        assert_eq!(q.current().unwrap().id, "/a/2");
-        // Every library track exactly once, the current one first.
-        let mut all = ids(&q);
-        assert_eq!(all.len(), 7);
-        all.sort();
-        assert_eq!(all, vec!["/a/1", "/a/2", "/a/3", "/a/4", "/b/1", "/b/2", "/b/3"]);
+        assert_eq!(q.current().unwrap().id, "/p/3.flac");
+        assert_eq!(q.tracks().len(), 12);
+        let mut got: Vec<String> = ids(&q).into_iter().map(str::to_owned).collect();
+        got.sort();
+        let mut want = expected_sorted.clone();
+        want.sort();
+        assert_eq!(got, want);
 
-        // Turning shuffle off goes back to the queue from before (album A), at the current track.
-        q.set_shuffle(false, &lib);
-        assert_eq!(ids(&q), vec!["/a/1", "/a/2", "/a/3", "/a/4"]);
-        assert_eq!(q.index(), Some(1));
-    }
-
-    #[test]
-    fn shuffle_off_on_a_track_outside_the_old_queue_goes_to_its_album() {
-        let lib = library();
-        let mut q = PlaybackQueue::default();
-        q.set_queue(lib[0].tracks.clone(), 0, &lib);
-        q.set_shuffle(true, &lib);
-        let b2 = q.tracks().iter().position(|t| t.id == "/b/2").unwrap();
-        q.jump_to(b2);
-        q.set_shuffle(false, &lib);
-        assert_eq!(ids(&q), vec!["/b/1", "/b/2", "/b/3"]);
-        assert_eq!(q.current().unwrap().id, "/b/2");
-    }
-
-    #[test]
-    fn play_in_shuffle_puts_chosen_track_first_then_the_library() {
-        let lib = library();
-        let mut q = PlaybackQueue::default();
-        q.set_shuffle(true, &lib);
-        q.set_queue(lib[1].tracks.clone(), 2, &lib);
-        assert_eq!(q.current().unwrap().id, "/b/3");
-        assert_eq!(q.tracks().len(), 7);
-        q.set_shuffle(false, &lib);
-        assert_eq!(ids(&q), vec!["/b/1", "/b/2", "/b/3"]);
+        q.set_shuffle(false);
+        assert_eq!(
+            ids(&q),
+            expected_sorted.iter().map(String::as_str).collect::<Vec<_>>()
+        );
         assert_eq!(q.index(), Some(2));
+
+        // Album/playlist play button (`start_index = None`) while shuffle is ON: picks a random first track.
+        let mut first_tracks = HashSet::new();
+        for _ in 0..16 {
+            let mut q = PlaybackQueue::default();
+            q.set_shuffle(true);
+            q.set_queue(tracks.clone(), None);
+            assert_eq!(q.index(), Some(0));
+            let cur_id = q.current().unwrap().id.clone();
+            first_tracks.insert(cur_id.clone());
+
+            let mut run_sorted: Vec<String> = ids(&q).into_iter().map(str::to_owned).collect();
+            run_sorted.sort();
+            assert_eq!(run_sorted, want);
+
+            q.set_shuffle(false);
+            assert_eq!(q.current().unwrap().id, cur_id);
+            assert_eq!(
+                ids(&q),
+                expected_sorted.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            first_tracks.len() > 1,
+            "expected random starting tracks when start_index is None, got {first_tracks:?}"
+        );
     }
 
     #[test]
-    fn restored_library_queue_turns_into_album_without_saved_original() {
+    fn restore_shuffled_session_without_original_keeps_queue_on_unshuffle() {
         let lib = library();
         let index: HashMap<String, (Track, Album)> = lib
             .iter()
             .flat_map(|a| a.tracks.iter().map(move |t| (t.id.clone(), (t.clone(), a.clone()))))
             .collect();
         let state = SessionState {
-            current_id: Some("/a/3".to_owned()),
-            index: 0,
+            current_id: Some("/b/1".to_owned()),
+            index: 1,
             position: 0.0,
             shuffle: true,
             repeat_mode: 0,
         };
-        let saved: Vec<String> = ["/a/3", "/b/1", "/a/1", "/b/3", "/a/2", "/b/2", "/a/4"]
+        let saved: Vec<String> = ["/a/3", "/b/1", "/a/1"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
         let mut q = PlaybackQueue::default();
         q.restore_session(&index, &state, &saved, None);
-        // Restoring does not spread again.
-        assert_eq!(ids(&q), saved.iter().map(String::as_str).collect::<Vec<_>>());
-        q.set_shuffle(false, &lib);
-        assert_eq!(ids(&q), vec!["/a/1", "/a/2", "/a/3", "/a/4"]);
-        assert_eq!(q.index(), Some(2));
-
-        // A smaller restored queue was the user's own: it is kept.
-        let mut q = PlaybackQueue::default();
-        q.restore_session(&index, &state, &saved[..3], None);
-        q.set_shuffle(false, &lib);
         assert_eq!(ids(&q), vec!["/a/3", "/b/1", "/a/1"]);
+        assert_eq!(q.index(), Some(1));
+
+        q.set_shuffle(false);
+        assert_eq!(ids(&q), vec!["/a/3", "/b/1", "/a/1"]);
+        assert_eq!(q.index(), Some(1));
+        assert_eq!(q.current().unwrap().id, "/b/1");
+    }
+
+    #[test]
+    fn repeat_mode_cycle_icons_and_hand_queue_preservation() {
+        assert_eq!(RepeatMode::Off.icon_name(), "repeat");
+        assert!(!RepeatMode::Off.is_active());
+        assert_eq!(RepeatMode::Off.cycle(), RepeatMode::All);
+
+        assert_eq!(RepeatMode::All.icon_name(), "repeat");
+        assert!(RepeatMode::All.is_active());
+        assert_eq!(RepeatMode::All.cycle(), RepeatMode::One);
+
+        assert_eq!(RepeatMode::One.icon_name(), "repeat1");
+        assert!(RepeatMode::One.is_active());
+        assert_eq!(RepeatMode::One.cycle(), RepeatMode::Off);
+
+        let mut q = PlaybackQueue::default();
+        let tracks = vec![
+            mk_track("/m/1.flac", "A", 100.0),
+            mk_track("/m/2.flac", "A", 100.0),
+        ];
+        q.set_queue(tracks, Some(0));
+        q.enqueue(vec![mk_track("/m/hand.flac", "H", 100.0)]);
+        assert_eq!(q.hand_len(), 1);
+
+        q.set_repeat(RepeatMode::One);
+        assert_eq!(q.step_next(true).unwrap().id, "/m/1.flac");
+        assert_eq!(q.index(), Some(0));
+        assert_eq!(q.hand_len(), 1);
+
+        assert!(matches!(
+            q.on_mpv_advanced("/m/1.flac", Some(0)),
+            MpvAdvance::Followed(t) if t.id == "/m/1.flac"
+        ));
+        assert_eq!(q.index(), Some(0));
+        assert_eq!(q.hand_len(), 1);
     }
 
     #[test]
     fn hand_queue_add_appends_to_line_and_play_next_goes_first() {
         let lib = library();
         let mut q = PlaybackQueue::default();
-        q.set_queue(lib[0].tracks.clone(), 0, &lib);
-        assert!(!q.enqueue(vec![mk_track("/x/1", "X", 200.0)], &lib));
-        assert!(!q.enqueue(vec![mk_track("/x/2", "X", 200.0)], &lib));
+        q.set_queue(lib[0].tracks.clone(), Some(0));
+        assert!(!q.enqueue(vec![mk_track("/x/1", "X", 200.0)]));
+        assert!(!q.enqueue(vec![mk_track("/x/2", "X", 200.0)]));
         // ADD_TO_QUEUE lands right after the current track, not after the album.
         assert_eq!(upcoming(&q), vec!["/x/1", "/x/2", "/a/2", "/a/3", "/a/4"]);
         assert_eq!(q.hand_len(), 2);
 
-        assert!(!q.play_next(vec![mk_track("/y/1", "Y", 200.0)], &lib));
+        assert!(!q.play_next(vec![mk_track("/y/1", "Y", 200.0)]));
         assert_eq!(upcoming(&q), vec!["/y/1", "/x/1", "/x/2", "/a/2", "/a/3", "/a/4"]);
         assert_eq!(q.hand_len(), 3);
 
@@ -958,14 +1037,14 @@ mod tests {
         q.step_next(false);
         assert_eq!(q.current().unwrap().id, "/y/1");
         assert_eq!(q.hand_len(), 2);
-        q.enqueue(vec![mk_track("/x/3", "X", 200.0)], &lib);
+        q.enqueue(vec![mk_track("/x/3", "X", 200.0)]);
         assert_eq!(upcoming(&q), vec!["/x/1", "/x/2", "/x/3", "/a/2", "/a/3", "/a/4"]);
 
         // A jump out of order ends the line.
         let a3 = q.tracks().iter().position(|t| t.id == "/a/3").unwrap();
         q.jump_to(a3);
         assert_eq!(q.hand_len(), 0);
-        q.enqueue(vec![mk_track("/z/1", "Z", 200.0)], &lib);
+        q.enqueue(vec![mk_track("/z/1", "Z", 200.0)]);
         assert_eq!(upcoming(&q), vec!["/z/1", "/a/4"]);
     }
 
@@ -973,20 +1052,19 @@ mod tests {
     fn hand_queue_in_shuffle_also_lands_in_the_queue_from_before() {
         let lib = library();
         let mut q = PlaybackQueue::default();
-        q.set_queue(lib[0].tracks.clone(), 0, &lib);
-        q.set_shuffle(true, &lib);
-        q.enqueue(vec![mk_track("/x/1", "X", 200.0)], &lib);
-        q.play_next(vec![mk_track("/y/1", "Y", 200.0)], &lib);
+        q.set_queue(lib[0].tracks.clone(), Some(0));
+        q.set_shuffle(true);
+        q.enqueue(vec![mk_track("/x/1", "X", 200.0)]);
+        q.play_next(vec![mk_track("/y/1", "Y", 200.0)]);
         assert_eq!(&upcoming(&q)[..2], &["/y/1", "/x/1"]);
-        q.set_shuffle(false, &lib);
+        q.set_shuffle(false);
         assert_eq!(ids(&q), vec!["/a/1", "/y/1", "/x/1", "/a/2", "/a/3", "/a/4"]);
     }
 
     #[test]
     fn enqueue_into_empty_queue_starts_a_new_one() {
-        let lib = library();
         let mut q = PlaybackQueue::default();
-        assert!(q.enqueue(vec![mk_track("/x/1", "X", 200.0)], &lib));
+        assert!(q.enqueue(vec![mk_track("/x/1", "X", 200.0)]));
         assert_eq!(q.current().unwrap().id, "/x/1");
         assert_eq!(q.hand_len(), 0);
     }
@@ -998,8 +1076,7 @@ mod tests {
         let dup = mk_track("/d/1", "D", 200.0);
         q.set_queue(
             vec![mk_track("/a/1", "A", 200.0), dup.clone(), mk_track("/a/2", "A", 200.0), dup.clone()],
-            0,
-            &[],
+            Some(0),
         );
         // Removing the second copy keeps the first one where it is.
         assert!(q.remove_at(3));
@@ -1009,22 +1086,21 @@ mod tests {
         let mut q = PlaybackQueue::default();
         q.set_queue(
             vec![mk_track("/a/1", "A", 200.0), dup.clone(), mk_track("/a/2", "A", 200.0), dup.clone()],
-            0,
-            &[],
+            Some(0),
         );
-        q.set_shuffle(true, &[]);
+        q.set_shuffle(true);
         let first_dup = q.tracks().iter().position(|t| t.id == "/d/1").unwrap();
         assert!(q.remove_at(first_dup));
-        q.set_shuffle(false, &[]);
+        q.set_shuffle(false);
         assert_eq!(ids(&q), vec!["/a/1", "/d/1", "/a/2"]);
 
         // Removing a hand-queued track shortens the line.
         let mut q = PlaybackQueue::default();
-        q.set_queue(lib[0].tracks.clone(), 0, &lib);
-        q.enqueue(vec![mk_track("/x/1", "X", 200.0), mk_track("/x/2", "X", 200.0)], &lib);
+        q.set_queue(lib[0].tracks.clone(), Some(0));
+        q.enqueue(vec![mk_track("/x/1", "X", 200.0), mk_track("/x/2", "X", 200.0)]);
         assert!(q.remove_at(1));
         assert_eq!(q.hand_len(), 1);
-        q.enqueue(vec![mk_track("/x/3", "X", 200.0)], &lib);
+        q.enqueue(vec![mk_track("/x/3", "X", 200.0)]);
         assert_eq!(upcoming(&q), vec!["/x/2", "/x/3", "/a/2", "/a/3", "/a/4"]);
         assert!(!q.remove_at(99));
     }
@@ -1036,7 +1112,7 @@ mod tests {
             mk_track("/m/1.flac", "A", 100.0),
             mk_track("/m/2.flac", "B", 100.0),
         ];
-        q.set_queue(tracks, 1, &[]);
+        q.set_queue(tracks, Some(1));
         assert_eq!(q.auto_next_index(), None);
         assert!(q.step_next(true).is_none());
 
@@ -1130,7 +1206,7 @@ mod tests {
         assert!(f(5, RepeatMode::Off, false, false, &unknown, &b1));
 
         let mut q = PlaybackQueue::default();
-        q.set_queue(vec![a1.clone(), b1.clone()], 0, &[]);
+        q.set_queue(vec![a1.clone(), b1.clone()], Some(0));
         assert!(q.crossfade_applies(1, 5, false));
         assert!(!q.crossfade_applies(0, 5, false));
         assert!(!q.crossfade_applies(7, 5, false));
@@ -1153,10 +1229,10 @@ mod tests {
         let tracks = (1..=4)
             .map(|i| mk_track(&format!("/m/{i}.flac"), "Album", 200.0))
             .collect();
-        q.set_queue(tracks, 0, &[]);
+        q.set_queue(tracks, Some(0));
 
         // Pretend fade targeted index 1 ("/m/2.flac"), then PlayNext inserts at index 1.
-        q.play_next(vec![mk_track("/m/inserted.flac", "Album", 200.0)], &[]);
+        q.play_next(vec![mk_track("/m/inserted.flac", "Album", 200.0)]);
         assert_eq!(q.find_track_near(1, "/m/2.flac"), Some(2));
         assert_eq!(q.jump_to_track_near(1, "/m/2.flac"), Some(2));
         assert_eq!(q.current().unwrap().id, "/m/2.flac");
@@ -1202,7 +1278,7 @@ mod tests {
         assert_eq!(active, shuffled_ids);
         assert_eq!(original, orig_ids);
 
-        q.set_shuffle(false, std::slice::from_ref(&alb));
+        q.set_shuffle(false);
         let restored_ids: Vec<&str> = q.tracks().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(restored_ids, vec!["/m/1.flac", "/m/2.flac", "/m/3.flac"]);
         assert_eq!(q.index(), Some(2));
@@ -1215,10 +1291,10 @@ mod tests {
         // D-25: A plays, B was handed to mpv as next. C is queued by hand just as mpv moves into B.
         let mut q = PlaybackQueue::default();
         let tracks = vec![mk_track("A", "X", 100.0), mk_track("B", "X", 100.0)];
-        q.set_queue(tracks, 0, &[]);
+        q.set_queue(tracks, Some(0));
         let handed = q.auto_next_index();
         assert_eq!(handed, Some(1));
-        q.enqueue(vec![mk_track("C", "Y", 100.0)], &[]);
+        q.enqueue(vec![mk_track("C", "Y", 100.0)]);
         // The controller hands C over now, but mpv already entered B (handed before the edit).
         let handed_after = q.auto_next_index();
         assert_eq!(handed_after, Some(1));
@@ -1245,12 +1321,12 @@ mod tests {
         // D-26: the UI's copy is the same allocation until the queue itself changes.
         let mut q = PlaybackQueue::default();
         let tracks: Vec<Track> = (0..5).map(|i| mk_track(&format!("t{i}"), "X", 100.0)).collect();
-        q.set_queue(tracks, 0, &[]);
+        q.set_queue(tracks, Some(0));
         let ui = q.shared_tracks();
         q.step_next(false);
         q.jump_to(3);
         assert!(Arc::ptr_eq(&ui, &q.shared_tracks()));
-        q.enqueue(vec![mk_track("h", "Y", 100.0)], &[]);
+        q.enqueue(vec![mk_track("h", "Y", 100.0)]);
         assert!(!Arc::ptr_eq(&ui, &q.shared_tracks()));
         // The UI's old list is untouched by the edit.
         assert_eq!(ui.len(), 5);
@@ -1262,8 +1338,8 @@ mod tests {
     fn remove_tracks_by_id_updates_indices_and_stops_when_current_deleted() {
         let mut q = PlaybackQueue::default();
         let tracks: Vec<Track> = (0..5).map(|i| mk_track(&format!("t{i}"), "X", 100.0)).collect();
-        q.set_queue(tracks, 1, &[]);
-        q.enqueue(vec![mk_track("t3", "Y", 100.0), mk_track("h2", "Y", 100.0)], &[]);
+        q.set_queue(tracks, Some(1));
+        q.enqueue(vec![mk_track("t3", "Y", 100.0), mk_track("h2", "Y", 100.0)]);
         // Remove t0 (before current t1) and t3 (in hand queue) -> t1 stays current at index 0.
         let mut drop = HashSet::new();
         drop.insert("t0".to_owned());

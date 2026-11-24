@@ -725,7 +725,6 @@ fn body_view<'a>(app: &'a App, accent: Color, alpha: f32, cover_size: f32, col_w
         },
     );
 
-    let repeating = app.repeat_mode != crate::playback::RepeatMode::Off;
     let mode = |name: &'static str, on: bool, msg: Message| {
         button(icons::icon(name, 24.0, fa(if on { theme::TEAL } else { theme::TEXT_DIM }, alpha)))
             .padding(8)
@@ -746,7 +745,7 @@ fn body_view<'a>(app: &'a App, accent: Color, alpha: f32, cover_size: f32, col_w
             .style(theme::bare_button_style())
             .on_press(Message::TogglePlayPause)),
         skip("skipforward", Message::Next),
-        mode("repeat", repeating, Message::CycleRepeat),
+        mode(app.repeat_mode.icon_name(), app.repeat_mode.is_active(), Message::CycleRepeat),
     ]
     .spacing(24)
     .align_y(Alignment::Center);
@@ -793,7 +792,7 @@ fn tab_btn<'a>(label: &'static str, on: bool, alpha: f32, msg: Message) -> Eleme
 fn panel<'a>(app: &'a App, accent: Color, alpha: f32) -> Element<'a, Message> {
     let upcoming_from = app.queue_index.map_or(0, |i| i + 1).min(app.queue_tracks.len());
     let upcoming_total = app.queue_tracks.len() - upcoming_from;
-    // Only the first rows are built: a shuffled library queues every track
+    // Only the first rows are built: large playlists can hold many tracks
     let shown_to = (upcoming_from + crate::popups::QUEUE_ROWS).min(app.queue_tracks.len());
     let upcoming: Vec<(usize, &rustygrade_core::Track)> =
         app.queue_tracks[upcoming_from..shown_to].iter().enumerate().map(|(i, t)| (upcoming_from + i, t)).collect();

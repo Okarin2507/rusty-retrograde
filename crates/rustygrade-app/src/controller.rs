@@ -83,7 +83,7 @@ pub enum ControllerCommand {
     SetPlaybackTickMode(PlaybackTickMode),
     PlayTrackList {
         tracks: Vec<Track>,
-        start_index: usize,
+        start_index: Option<usize>,
     },
     JumpToQueueIndex(usize),
     PlayNext(Track),
@@ -1555,7 +1555,7 @@ impl Coordinator {
             } => {
                 self.crossfade
                     .cancel(&self.mpv, self.shared_vol, self.shared_muted);
-                self.queue.set_queue(tracks, start_index, &self.albums);
+                self.queue.set_queue(tracks, start_index);
                 self.playback_failures = 0;
                 self.emit_queue();
                 self.save_queue_async();
@@ -1647,7 +1647,7 @@ impl Coordinator {
                     let seek = self.pending_restore_seek.take().unwrap_or(0.0);
                     self.start_current_track(seek).await;
                 } else if let Some(first) = self.first_library_track() {
-                    self.queue.set_queue(vec![first], 0, &self.albums);
+                    self.queue.set_queue(vec![first], Some(0));
                     self.emit_queue();
                     self.save_queue_async();
                     self.start_current_track(0.0).await;
@@ -1684,7 +1684,7 @@ impl Coordinator {
                 self.crossfade
                     .cancel(&self.mpv, self.shared_vol, self.shared_muted);
                 self.crossfade_attempted_track_id = None;
-                self.queue.toggle_shuffle(&self.albums);
+                self.queue.toggle_shuffle();
                 self.emit_queue();
                 self.save_queue_async();
                 self.save_session_state_async();
@@ -2246,6 +2246,10 @@ impl Coordinator {
     /// Tells mpv which file comes next for gapless playback (C# `SyncNext`): the same file on
     /// repeat-one, nothing when the change fades over to the spare engine instead.
     fn sync_mpv_next(&mut self) {
+        if self.mpv_loaded_track_id.is_none() {
+            self.hand_mpv_next(None);
+            return;
+        }
         let direct = self.is_direct_output();
         let next = self.queue.auto_next_index().filter(|&idx| {
             !self
@@ -2773,7 +2777,7 @@ impl Coordinator {
                     let seek = self.pending_restore_seek.take().unwrap_or(0.0);
                     self.start_current_track(seek).await;
                 } else if let Some(first) = self.first_library_track() {
-                    self.queue.set_queue(vec![first], 0, &self.albums);
+                    self.queue.set_queue(vec![first], Some(0));
                     self.emit_queue();
                     self.save_queue_async();
                     self.start_current_track(0.0).await;
@@ -2831,7 +2835,7 @@ impl Coordinator {
                 self.crossfade
                     .cancel(&self.mpv, self.shared_vol, self.shared_muted);
                 self.crossfade_attempted_track_id = None;
-                self.queue.set_shuffle(shuffle, &self.albums);
+                self.queue.set_shuffle(shuffle);
                 self.emit_queue();
                 self.save_queue_async();
                 self.save_session_state_async();
@@ -3304,7 +3308,7 @@ impl Coordinator {
                 self.pending_open_play.clear();
                 self.handle_command(ControllerCommand::PlayTrackList {
                     tracks: found,
-                    start_index: 0,
+                    start_index: Some(0),
                 })
                 .await;
             } else {
@@ -3330,7 +3334,7 @@ impl Coordinator {
         self.pending_open_play.clear();
         self.handle_command(ControllerCommand::PlayTrackList {
             tracks: found,
-            start_index: 0,
+            start_index: Some(0),
         })
         .await;
     }
@@ -3372,9 +3376,9 @@ impl Coordinator {
         }
         self.crossfade_attempted_track_id = None;
         let started_new = if at_front {
-            self.queue.play_next(tracks, &self.albums)
+            self.queue.play_next(tracks)
         } else {
-            self.queue.enqueue(tracks, &self.albums)
+            self.queue.enqueue(tracks)
         };
         if started_new {
             self.emit_queue();

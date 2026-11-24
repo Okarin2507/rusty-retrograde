@@ -283,7 +283,7 @@ pub enum Message {
     OpenArtist(String),
     CloseArtistDetail,
     SetSearchTab(SearchTab),
-    PlayDetail(pages::DetailCtx, usize),
+    PlayDetail(pages::DetailCtx, Option<usize>),
     /// A track row was lifted on this page (its index in the list shown).
     ReorderLift(pages::DetailCtx, usize),
     /// The lifted row was dropped: `(from, to)`, or `None` when it went back.
@@ -348,7 +348,7 @@ pub enum Message {
     SelectLibrarySort(LibrarySort),
     SelectAlbum(AlbumKey),
     SelectArtist(String),
-    PlayAlbumTrack(AlbumKey, usize),
+    PlayAlbumTrack(AlbumKey, Option<usize>),
     QueueAlbum(AlbumKey),
     PlayTrackFromList(Vec<Track>, usize),
     PlayNext(Track),
@@ -1844,7 +1844,7 @@ impl App {
             Message::PlayDetail(ctx, idx) => {
                 let tracks = self.detail_tracks(&ctx);
                 if !tracks.is_empty() {
-                    let start_index = idx.min(tracks.len() - 1);
+                    let start_index = idx.map(|i| i.min(tracks.len() - 1));
                     let _ = self.cmd_tx.send(ControllerCommand::PlayTrackList { tracks, start_index });
                 }
                 Task::none()
@@ -1858,7 +1858,7 @@ impl App {
             }
             Message::PlaySearchTrack(i) => {
                 if i < self.search_tracks.len() {
-                    let _ = self.cmd_tx.send(ControllerCommand::PlayTrackList { tracks: self.search_tracks.clone(), start_index: i });
+                    let _ = self.cmd_tx.send(ControllerCommand::PlayTrackList { tracks: self.search_tracks.clone(), start_index: Some(i) });
                 }
                 Task::none()
             }
@@ -2123,7 +2123,7 @@ impl App {
                 {
                     let _ = self.cmd_tx.send(ControllerCommand::PlayTrackList {
                         tracks: album.tracks.clone(),
-                        start_index: tidx,
+                        start_index: tidx.map(|i| i.min(album.tracks.len() - 1)),
                     });
                 }
                 Task::none()
@@ -2139,7 +2139,7 @@ impl App {
             Message::PlayTrackFromList(tracks, idx) => {
                 let _ = self.cmd_tx.send(ControllerCommand::PlayTrackList {
                     tracks,
-                    start_index: idx,
+                    start_index: Some(idx),
                 });
                 Task::none()
             }

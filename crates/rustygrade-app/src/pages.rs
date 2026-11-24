@@ -977,7 +977,7 @@ pub fn detail_page<'a>(app: &'a App, spec: DetailSpec<'a>, accent: Color) -> Ele
         border: Border { radius: 0.0.into(), ..Default::default() },
         ..Default::default()
     })
-    .on_press_maybe(has_tracks.then(|| Message::PlayDetail(spec.ctx.clone(), 0)));
+    .on_press_maybe(has_tracks.then(|| Message::PlayDetail(spec.ctx.clone(), None)));
     let mut actions = row![
         play,
         button(icons::icon("listmusic", 26.0, theme::TEXT_DIM))
@@ -1089,7 +1089,7 @@ pub fn detail_page<'a>(app: &'a App, spec: DetailSpec<'a>, accent: Color) -> Ele
             match *item {
                 DetailItem::Disc(d) => rows.push(disc_header(d)),
                 DetailItem::Track(i) => {
-                    let play = Message::PlayDetail(spec.ctx.clone(), i);
+                    let play = Message::PlayDetail(spec.ctx.clone(), Some(i));
                     rows.push(track_row(
                         app,
                         tracks[i].clone(),

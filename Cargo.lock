@@ -3491,7 +3491,7 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "iced",
  "image",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-audio"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "libloading 0.9.1",
  "libspa",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fast_image_resize",
  "image",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-linux"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "ashpd",
  "futures-util",

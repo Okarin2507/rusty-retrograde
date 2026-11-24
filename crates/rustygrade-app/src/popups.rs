@@ -13,7 +13,7 @@ use crate::views::bold;
 use crate::{App, Message, ReplayGainOption};
 
 const WIDTH: f32 = 320.0;
-/// Upcoming queue rows built at most (popup and full screen): shuffle queues the whole library.
+/// Upcoming queue rows built at most (popup and full screen): large playlists can hold many tracks.
 pub const QUEUE_ROWS: usize = 50;
 
 fn frame_style(_t: &iced::Theme) -> container::Style {
@@ -145,7 +145,7 @@ fn queue_popup<'a>(app: &'a App, accent: Color) -> Element<'a, Message> {
         }
         list = list.push(section_band("NEXT SEQUENCE", theme::GOLD, false));
         let from = app.queue_index.map_or(0, |i| i + 1).min(app.queue_tracks.len());
-        // Only the next rows are built: a shuffled library queues every track
+        // Only the next rows are built: large playlists can hold many tracks
         let to = (from + QUEUE_ROWS).min(app.queue_tracks.len());
         for i in from..to {
             list = list.push(queue_row(app, i, accent, false, i - from < app.queue_hand_len));

@@ -461,23 +461,37 @@ pub fn render_mini_player(app: &App) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Alignment::Start);
 
+    let shuffle_col = if app.shuffle { theme::TEAL } else { theme::TEXT_MUTE };
+    let repeat_col = if app.repeat_mode.is_active() { theme::TEAL } else { theme::TEXT_MUTE };
     let controls_row = row![
         space::horizontal(),
+        button(icons::icon("shuffle", 15.0, shuffle_col))
+            .style(theme::bare_button_style())
+            .padding(4)
+            .on_press(Message::ToggleShuffle),
         button(icons::icon("skipback", 17.0, theme::TEXT_DIM))
             .style(theme::bare_button_style())
             .padding(4)
             .on_press(Message::Previous),
-        crate::motion::hover_scope_slop(crate::motion::HEX_HOVER, 10.0, button(icons::hex_play(app.is_playing, 40.0))
-            .style(theme::bare_button_style())
-            .padding(0)
-            .on_press(Message::TogglePlayPause)),
+        crate::motion::hover_scope_slop(
+            crate::motion::HEX_HOVER,
+            6.0,
+            button(icons::hex_play(app.is_playing, 40.0))
+                .style(theme::bare_button_style())
+                .padding(0)
+                .on_press(Message::TogglePlayPause),
+        ),
         button(icons::icon("skipforward", 17.0, theme::TEXT_DIM))
             .style(theme::bare_button_style())
             .padding(4)
             .on_press(Message::Next),
+        button(icons::icon(app.repeat_mode.icon_name(), 15.0, repeat_col))
+            .style(theme::bare_button_style())
+            .padding(4)
+            .on_press(Message::CycleRepeat),
         space::horizontal(),
     ]
-    .spacing(22)
+    .spacing(16)
     .align_y(Alignment::Center);
 
     let mute_ts = Color::from_rgb8(0x6B, 0x69, 0x63);
@@ -1364,7 +1378,7 @@ fn albums_grid(app: &App, accent: Color) -> Element<'_, Message> {
                     None,
                     Some(crate::pages::CardMotion {
                         key: crate::motion::key_of(&key),
-                        play: Some(Message::PlayAlbumTrack(key, 0)),
+                        play: Some(Message::PlayAlbumTrack(key, None)),
                     }),
                 );
                 context_menu::trigger(card, move |pos| Message::OpenAlbumMenu(key_menu.clone(), pos))
@@ -2652,7 +2666,6 @@ fn view_transport(app: &App, accent: Color) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Length::FillPortion(1));
 
-    let repeating = app.repeat_mode != crate::playback::RepeatMode::Off;
     let center = column![
         row![
             icon_btn("shuffle", 18.0, app.shuffle, theme::TEAL, Message::ToggleShuffle),
@@ -2662,7 +2675,7 @@ fn view_transport(app: &App, accent: Color) -> Element<'_, Message> {
                 .style(theme::bare_button_style())
                 .on_press(Message::TogglePlayPause)),
             icon_btn("skipforward", 22.0, false, accent, Message::Next),
-            icon_btn("repeat", 18.0, repeating, theme::TEAL, Message::CycleRepeat),
+            icon_btn(app.repeat_mode.icon_name(), 18.0, app.repeat_mode.is_active(), theme::TEAL, Message::CycleRepeat),
         ]
         .spacing(12)
         .align_y(Alignment::Center),

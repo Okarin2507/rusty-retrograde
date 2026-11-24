@@ -2,7 +2,7 @@
 
 # Rustygrade
 
-![Version](https://img.shields.io/badge/VERSION-1.0.0-4FD6BE?style=for-the-badge)
+![Version](https://img.shields.io/badge/VERSION-1.0.1-4FD6BE?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/PLATFORM-LINUX-E8C060?style=for-the-badge&logo=linux&logoColor=white)
 ![Rust](https://img.shields.io/badge/RUST-2024-FF6B35?style=for-the-badge&logo=rust&logoColor=white)
 
