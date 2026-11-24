@@ -13,11 +13,12 @@ use lofty::tag::{Accessor, ItemKey};
 use rayon::prelude::*;
 use regex::Regex;
 
+use crate::collections::CollectionsStore;
 use crate::covers::{
-    ImageLimits, MAX_COVER_FILE_BYTES, MAX_FULL_COVER_EDGE, PlaylistCovers, decode_oriented,
-    encode_capped_full, encode_resized_jpeg,
+    ImageLimits, MAX_COVER_FILE_BYTES, PlaylistCovers, delete_unreferenced_covers,
+    save_cover_bytes, sha256,
 };
-use crate::library::{AlbumDto, LibraryError, LibraryMap, LibraryStore, TrackDto, try_delete};
+use crate::library::{AlbumDto, LibraryError, LibraryMap, LibraryStore, TrackDto};
 use crate::paths::CoverPaths;
 
 pub const AUDIO_EXTENSIONS: &[&str] = &[
@@ -50,6 +51,7 @@ pub struct ScanResult {
     pub covers: usize,
     pub updated_tracks: usize,
     pub removed_tracks: usize,
+    pub removed_albums: usize,
     pub missing_tracks: usize,
     pub merged_albums: usize,
 }
@@ -60,15 +62,26 @@ impl ScanResult {
             || self.covers > 0
             || self.updated_tracks > 0
             || self.removed_tracks > 0
+            || self.removed_albums > 0
             || self.merged_albums > 0
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrunePolicy {
+    #[default]
+    Never,
+    Safe,
+    ForceAll,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanOptions {
-    pub prune_missing: bool,
+    pub prune: PrunePolicy,
     pub max_threads: Option<usize>,
     pub force: bool,
+    /// Re-extracts album covers during the scan without disturbing covers when extraction fails.
+    pub resync_covers: bool,
 }
 
 #[derive(Default)]
@@ -77,6 +90,7 @@ struct Discovery {
     walked_dirs: Vec<PathBuf>,
     unreadable_dirs: Vec<PathBuf>,
     gone_dirs: Vec<PathBuf>,
+    suspect_empty_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,17 +210,219 @@ fn dir_identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+#[cfg(unix)]
+fn unescape_mount_octal(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let v = ((bytes[i + 1] - b'0') << 6)
+                | ((bytes[i + 2] - b'0') << 3)
+                | (bytes[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(unix)]
+fn parse_mountinfo(content: &str) -> Vec<PathBuf> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let mp = line.split(' ').nth(4)?;
+            if mp.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(unescape_mount_octal(mp)))
+            }
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn parse_fstab(content: &str) -> Vec<PathBuf> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let mp = trimmed.split_whitespace().nth(1)?;
+            if mp == "none" || mp == "swap" {
+                None
+            } else {
+                Some(PathBuf::from(unescape_mount_octal(mp)))
+            }
+        })
+        .collect()
+}
+
+fn is_unmounted_mountpoint_from(
+    dir: &Path,
+    active_mounts: &[PathBuf],
+    fstab_mounts: &[PathBuf],
+) -> bool {
+    if active_mounts.iter().any(|m| m == dir) {
+        return false;
+    }
+    if fstab_mounts.iter().any(|m| {
+        m != Path::new("/")
+            && (dir == m || dir.starts_with(m))
+            && !active_mounts.iter().any(|a| a == m)
+    }) {
+        return true;
+    }
+    for prefix in ["/mnt", "/media", "/run/media"] {
+        let p = Path::new(prefix);
+        if dir.starts_with(p) {
+            let has_active = active_mounts.iter().any(|m| {
+                m.starts_with(p) && m != p && (dir == m || dir.starts_with(m) || m.starts_with(dir))
+            });
+            if !has_active {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+struct MountSnapshot {
+    #[cfg(unix)]
+    active_mounts: Vec<PathBuf>,
+    #[cfg(unix)]
+    fstab_mounts: Vec<PathBuf>,
+    #[cfg(unix)]
+    loaded: bool,
+}
+
+impl MountSnapshot {
+    fn new() -> Self {
+        Self {
+            #[cfg(unix)]
+            active_mounts: Vec::new(),
+            #[cfg(unix)]
+            fstab_mounts: Vec::new(),
+            #[cfg(unix)]
+            loaded: false,
+        }
+    }
+
+    fn looks_like_unmounted(&mut self, dir: &Path, root_aliases: &[(PathBuf, PathBuf)]) -> bool {
+        #[cfg(unix)]
+        {
+            if !self.loaded {
+                self.loaded = true;
+                if let Ok(text) = fs::read_to_string("/proc/self/mountinfo") {
+                    self.active_mounts = parse_mountinfo(&text);
+                }
+                if let Ok(text) = fs::read_to_string("/etc/fstab") {
+                    self.fstab_mounts = parse_fstab(&text);
+                }
+            }
+            if is_unmounted_mountpoint_from(dir, &self.active_mounts, &self.fstab_mounts) {
+                return true;
+            }
+            for (canon_root, raw_root) in root_aliases {
+                if let Ok(rel) = dir.strip_prefix(canon_root) {
+                    let aliased = if rel.as_os_str().is_empty() {
+                        raw_root.clone()
+                    } else {
+                        raw_root.join(rel)
+                    };
+                    if aliased != dir
+                        && is_unmounted_mountpoint_from(
+                            &aliased,
+                            &self.active_mounts,
+                            &self.fstab_mounts,
+                        )
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (dir, root_aliases);
+            false
+        }
+    }
+}
+
+fn push_dir_with_aliases(dir: &Path, root_aliases: &[(PathBuf, PathBuf)], out: &mut Vec<PathBuf>) {
+    if !out.iter().any(|existing| existing == dir) {
+        out.push(dir.to_path_buf());
+    }
+    for (canon_root, raw_root) in root_aliases {
+        if let Ok(rel) = dir.strip_prefix(canon_root) {
+            let aliased = if rel.as_os_str().is_empty() {
+                raw_root.clone()
+            } else {
+                raw_root.join(rel)
+            };
+            if aliased != dir && !out.iter().any(|existing| existing == &aliased) {
+                out.push(aliased);
+            }
+        }
+    }
+}
+
 fn walk_paths(paths: &[PathBuf]) -> Discovery {
     let mut found = Discovery::default();
     let mut stack = Vec::new();
     let mut visited_dirs: HashSet<(u64, u64)> = HashSet::new();
+    let mut mounts = MountSnapshot::new();
+    let mut root_aliases: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for p in paths {
         if p.is_dir() {
             let dir = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            if dir_identity(&dir).is_none_or(|id| visited_dirs.insert(id)) {
-                stack.push(dir.clone());
-                found.walked_dirs.push(dir);
+            if p != &dir {
+                root_aliases.push((dir.clone(), p.clone()));
+            }
+            match fs::read_dir(&dir) {
+                Ok(entries) => {
+                    push_dir_with_aliases(&dir, &root_aliases, &mut found.walked_dirs);
+                    let first_visit = dir_identity(&dir).is_none_or(|id| visited_dirs.insert(id));
+                    let mut had_any_entry = false;
+                    for entry in entries.flatten() {
+                        had_any_entry = true;
+                        if !first_visit {
+                            break;
+                        }
+                        let path = entry.path();
+                        let Ok(ft) = entry.file_type() else {
+                            continue;
+                        };
+                        if ft.is_symlink() {
+                            continue;
+                        }
+                        if ft.is_dir() {
+                            if dir_identity(&path).is_none_or(|id| visited_dirs.insert(id)) {
+                                stack.push(path);
+                            }
+                        } else if ft.is_file() && Scanner::is_audio_file(&path) {
+                            found.files.push(path);
+                        }
+                    }
+                    if !had_any_entry && mounts.looks_like_unmounted(&dir, &root_aliases) {
+                        push_dir_with_aliases(&dir, &root_aliases, &mut found.suspect_empty_dirs);
+                    }
+                }
+                Err(_) => {
+                    push_dir_with_aliases(&dir, &root_aliases, &mut found.unreadable_dirs);
+                }
             }
         } else if p.is_file() {
             if Scanner::is_audio_file(p) {
@@ -215,8 +431,8 @@ fn walk_paths(paths: &[PathBuf]) -> Discovery {
                     .push(fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
             }
         } else if p.is_absolute() {
-            // An absent root (moved folder, unmounted drive) counts its tracks as missing. They are
-            // only reported; dropping them needs `prune_missing`, which the user has to confirm.
+            // An absent root (moved folder, unmounted drive) counts its tracks as suspect missing.
+            // Dropping them needs `PrunePolicy::ForceAll`, which the user has to confirm.
             found.gone_dirs.push(p.clone());
         }
     }
@@ -224,7 +440,9 @@ fn walk_paths(paths: &[PathBuf]) -> Discovery {
     while let Some(dir) = stack.pop() {
         match fs::read_dir(&dir) {
             Ok(entries) => {
+                let mut had_any_entry = false;
                 for entry in entries.flatten() {
+                    had_any_entry = true;
                     let path = entry.path();
                     let Ok(ft) = entry.file_type() else {
                         continue;
@@ -240,9 +458,12 @@ fn walk_paths(paths: &[PathBuf]) -> Discovery {
                         found.files.push(path);
                     }
                 }
+                if !had_any_entry && mounts.looks_like_unmounted(&dir, &root_aliases) {
+                    push_dir_with_aliases(&dir, &root_aliases, &mut found.suspect_empty_dirs);
+                }
             }
             Err(_) => {
-                found.unreadable_dirs.push(dir);
+                push_dir_with_aliases(&dir, &root_aliases, &mut found.unreadable_dirs);
             }
         }
     }
@@ -259,8 +480,10 @@ fn scan_locked(
     let mut dirty = false;
     let mut touched: HashSet<String> = HashSet::new();
     let mut mixed: HashSet<String> = HashSet::new();
+    let mut detached_covers: Vec<PathBuf> = Vec::new();
+    let mut removed_albums = 0usize;
 
-    let merged = merge_split_albums(&mut library, &mut touched, &mut mixed);
+    let merged = merge_split_albums(&mut library, &mut touched, &mut mixed, &mut detached_covers);
 
     // Map lowercase filePath -> (album_key, track_index)
     let mut by_path: HashMap<String, (String, usize)> = HashMap::new();
@@ -309,12 +532,18 @@ fn scan_locked(
         }
     }
 
-    let gone = collect_missing(&library, &by_path, &found, &seen_lower);
-    let missing = gone.len();
-    let removed = if options.prune_missing {
-        prune_tracks(&mut library, &gone, &mut touched)
-    } else {
-        0
+    let missing_tracks = collect_missing(&library, &by_path, &found, &seen_lower);
+    let (removed, missing) = match options.prune {
+        PrunePolicy::Never => (0, missing_tracks.safe.len() + missing_tracks.suspect.len()),
+        PrunePolicy::Safe => (
+            prune_tracks(&mut library, &missing_tracks.safe, &mut touched),
+            missing_tracks.suspect.len(),
+        ),
+        PrunePolicy::ForceAll => {
+            let mut all_gone = missing_tracks.safe;
+            all_gone.extend(missing_tracks.suspect);
+            (prune_tracks(&mut library, &all_gone, &mut touched), 0)
+        }
     };
 
     let mut parsed_results: Vec<Parsed> = Vec::new();
@@ -509,16 +738,22 @@ fn scan_locked(
         }
     }
 
+    if options.prune != PrunePolicy::Never {
+        for (key, album) in &library {
+            if album.tracks.as_ref().is_none_or(|t| t.is_empty()) {
+                touched.insert(key.clone());
+            }
+        }
+    }
+
     for key in &touched {
         let empty = library
             .get(key)
             .is_some_and(|a| a.tracks.as_ref().is_none_or(|t| t.is_empty()));
         if empty {
-            library.shift_remove(key);
-            // Cover files only go with a confirmed prune; an orphaned cover is harmless.
-            if options.prune_missing {
-                try_delete(&CoverPaths::thumb_path(key));
-                try_delete(&CoverPaths::full_path(key));
+            if let Some(removed_album) = library.shift_remove(key) {
+                removed_albums += 1;
+                collect_album_cover_candidates(key, &removed_album, &mut detached_covers);
             }
             continue;
         }
@@ -539,10 +774,11 @@ fn scan_locked(
         .filter(|k| {
             library
                 .get(k)
-                .is_some_and(|a| a.cover_art.as_deref().unwrap_or("").is_empty())
+                .is_some_and(|a| options.resync_covers || album_cover_missing(a))
         })
         .collect();
     let mut covers = 0usize;
+    let mut cover_dedup_cache: HashMap<[u8; 32], String> = HashMap::new();
     let total_covers = needing.len();
     for (i, key) in needing.into_iter().enumerate() {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -558,9 +794,27 @@ fn scan_locked(
         }
         let pic_src = picture_source.get(&key).map(String::as_str);
         if let Some(album) = library.get(&key)
-            && let Some((thumb, full)) = find_and_save_cover(&key, album, pic_src)
+            && let Some((thumb, full)) =
+                find_and_save_cover(album, pic_src, &mut cover_dedup_cache)
             && let Some(album_mut) = library.get_mut(&key)
         {
+            let new_thumb_local = CoverPaths::to_local_path(Some(&thumb));
+            let new_full_local = CoverPaths::to_local_path(Some(&full));
+            if let Some(old) = CoverPaths::to_local_path(album_mut.cover_art.as_deref())
+                && new_thumb_local.as_ref() != Some(&old)
+            {
+                detached_covers.push(old);
+            }
+            if let Some(old) = CoverPaths::to_local_path(album_mut.cover_art_full.as_deref())
+                && new_full_local.as_ref() != Some(&old)
+            {
+                detached_covers.push(old);
+            }
+            if album_mut.cover_art.as_deref() != Some(thumb.as_str())
+                || album_mut.cover_art_full.as_deref() != Some(full.as_str())
+            {
+                dirty = true;
+            }
             album_mut.cover_art = Some(thumb);
             album_mut.cover_art_full = Some(full);
             covers += 1;
@@ -573,7 +827,8 @@ fn scan_locked(
         covers,
         updated_tracks: updated,
         removed_tracks: removed,
-        missing_tracks: if options.prune_missing { 0 } else { missing },
+        removed_albums,
+        missing_tracks: missing,
         merged_albums: merged,
     };
     if !mixed.is_empty() {
@@ -581,44 +836,88 @@ fn scan_locked(
     }
     if result.changed() || dirty {
         LibraryStore::save_raw(&library)?;
+        if !detached_covers.is_empty() {
+            let collections = CollectionsStore::load();
+            delete_unreferenced_covers(&detached_covers, &library, &collections);
+        }
     }
     Ok(result)
 }
 
-/// Library tracks under the scanned roots whose files are gone, as `(lowercase path, album key)`.
-/// Tracks under unreadable folders are skipped; an empty or absent root counts as missing.
+fn collect_album_cover_candidates(key: &str, album: &AlbumDto, out: &mut Vec<PathBuf>) {
+    if let Some(p) = CoverPaths::to_local_path(album.cover_art.as_deref()) {
+        out.push(p);
+    }
+    if let Some(p) = CoverPaths::to_local_path(album.cover_art_full.as_deref()) {
+        out.push(p);
+    }
+    out.push(CoverPaths::thumb_path(key));
+    out.push(CoverPaths::full_path(key));
+}
+
+fn album_cover_missing(album: &AlbumDto) -> bool {
+    let Some(thumb) = CoverPaths::to_local_path(album.cover_art.as_deref()) else {
+        return true;
+    };
+    if !thumb.is_file() {
+        return true;
+    }
+    if let Some(full) = CoverPaths::to_local_path(album.cover_art_full.as_deref())
+        && !full.is_file()
+    {
+        return true;
+    }
+    false
+}
+
+#[derive(Default)]
+struct MissingTracks {
+    safe: Vec<(String, String)>,
+    suspect: Vec<(String, String)>,
+}
+
+/// Library tracks under the scanned roots whose files are gone, split into `safe` (online folder)
+/// and `suspect` (absent root or empty directory looking like an unmounted mount point).
+/// Tracks under unreadable folders are skipped.
 fn collect_missing(
     library: &LibraryMap,
     by_path: &HashMap<String, (String, usize)>,
     found: &Discovery,
     seen_lower: &HashSet<String>,
-) -> Vec<(String, String)> {
+) -> MissingTracks {
     if found.walked_dirs.is_empty() && found.gone_dirs.is_empty() {
-        return Vec::new();
+        return MissingTracks::default();
     }
-    by_path
-        .iter()
-        .filter_map(|(low_path, (album_key, idx))| {
-            if seen_lower.contains(low_path) {
-                return None;
-            }
-            let fp = library
-                .get(album_key)
-                .and_then(|a| a.tracks.as_ref())
-                .and_then(|ts| ts.get(*idx))
-                .and_then(|t| t.file_path.as_deref())?;
-            if is_under_any(fp, &found.unreadable_dirs) {
-                return None;
-            }
-            if !is_under_any(fp, &found.walked_dirs) && !is_under_any(fp, &found.gone_dirs) {
-                return None;
-            }
-            if Path::new(fp).exists() {
-                return None;
-            }
-            Some((low_path.clone(), album_key.clone()))
-        })
-        .collect()
+    let mut out = MissingTracks::default();
+    for (low_path, (album_key, idx)) in by_path {
+        if seen_lower.contains(low_path) {
+            continue;
+        }
+        let Some(fp) = library
+            .get(album_key)
+            .and_then(|a| a.tracks.as_ref())
+            .and_then(|ts| ts.get(*idx))
+            .and_then(|t| t.file_path.as_deref())
+        else {
+            continue;
+        };
+        if is_under_any(fp, &found.unreadable_dirs) {
+            continue;
+        }
+        if !is_under_any(fp, &found.walked_dirs) && !is_under_any(fp, &found.gone_dirs) {
+            continue;
+        }
+        if Path::new(fp).exists() {
+            continue;
+        }
+        let item = (low_path.clone(), album_key.clone());
+        if is_under_any(fp, &found.gone_dirs) || is_under_any(fp, &found.suspect_empty_dirs) {
+            out.suspect.push(item);
+        } else {
+            out.safe.push(item);
+        }
+    }
+    out
 }
 
 /// Drops the given missing tracks from the library; returns how many were removed.
@@ -727,6 +1026,7 @@ fn merge_split_albums(
     library: &mut LibraryMap,
     touched: &mut HashSet<String>,
     mixed: &mut HashSet<String>,
+    detached_covers: &mut Vec<PathBuf>,
 ) -> usize {
     let mut merged = 0usize;
     let keys: Vec<String> = library.keys().cloned().collect();
@@ -796,8 +1096,7 @@ fn merge_split_albums(
             target.cover_art = split_owned.cover_art;
             target.cover_art_full = split_owned.cover_art_full;
         } else {
-            try_delete(&CoverPaths::thumb_path(&key));
-            try_delete(&CoverPaths::full_path(&key));
+            collect_album_cover_candidates(&key, &split_owned, detached_covers);
         }
         if target.year == 0 {
             target.year = split_owned.year;
@@ -1003,9 +1302,9 @@ fn codec_name(ft: FileType, path: &Path) -> String {
 }
 
 fn find_and_save_cover(
-    album_key: &str,
     album: &AlbumDto,
     picture_source: Option<&str>,
+    cache: &mut HashMap<[u8; 32], String>,
 ) -> Option<(String, String)> {
     let mut data: Option<Vec<u8>> = picture_source.and_then(|p| read_embedded_picture(Path::new(p)));
     let tracks: Vec<&str> = album
@@ -1053,7 +1352,7 @@ fn find_and_save_cover(
         }
     }
 
-    save_cover(album_key, &data?)
+    save_cover(&data?, cache)
 }
 
 fn read_embedded_picture(source_file: &Path) -> Option<Vec<u8>> {
@@ -1090,39 +1389,18 @@ fn read_folder_image(folder: &Path) -> Option<Vec<u8>> {
     None
 }
 
-fn save_cover(album_name: &str, data: &[u8]) -> Option<(String, String)> {
+fn save_cover(data: &[u8], cache: &mut HashMap<[u8; 32], String>) -> Option<(String, String)> {
     if !ImageLimits::is_sane_bytes(data) {
         return None;
     }
-    fs::create_dir_all(CoverPaths::cover_dir()).ok()?;
-    let thumb = CoverPaths::thumb_path(album_name);
-    let full = CoverPaths::full_path(album_name);
-    let need_full = !full.exists();
-    let need_thumb = !thumb.exists();
-    if need_full || need_thumb {
-        let img = decode_oriented(image::ImageReader::new(std::io::Cursor::new(data))).ok();
-        if need_full {
-            let full_bytes = match &img {
-                Some(img) if img.width().max(img.height()) > MAX_FULL_COVER_EDGE => {
-                    encode_capped_full(img, MAX_FULL_COVER_EDGE, 90)
-                        .unwrap_or_else(|_| data.to_vec())
-                }
-                _ => data.to_vec(),
-            };
-            fs::write(&full, full_bytes).ok()?;
-        }
-        if need_thumb {
-            let thumb_bytes = img
-                .as_ref()
-                .and_then(|img| encode_resized_jpeg(img, 400, 80).ok())
-                .unwrap_or_else(|| data.to_vec());
-            fs::write(&thumb, thumb_bytes).ok()?;
-        }
+    let raw_hash = sha256(data);
+    if let Some(url) = cache.get(&raw_hash) {
+        return Some((url.clone(), url.clone()));
     }
-    Some((
-        CoverPaths::to_file_url(&thumb),
-        CoverPaths::to_file_url(&full),
-    ))
+    let path = save_cover_bytes(data).ok()?;
+    let url = CoverPaths::to_file_url(&path);
+    cache.insert(raw_hash, url.clone());
+    Some((url.clone(), url))
 }
 
 #[cfg(test)]
@@ -1176,7 +1454,8 @@ mod tests {
 
         let mut touched = HashSet::new();
         let mut mixed = HashSet::new();
-        let merged = merge_split_albums(&mut lib, &mut touched, &mut mixed);
+        let mut detached = Vec::new();
+        let merged = merge_split_albums(&mut lib, &mut touched, &mut mixed, &mut detached);
         assert_eq!(merged, 1);
         assert!(lib.contains_key("EP"));
         assert!(!lib.contains_key("EP (Artist B)"));
@@ -1200,30 +1479,77 @@ mod tests {
     }
 
     #[test]
-    fn offline_roots_report_missing_tracks_and_prune_only_on_request() {
+    fn unmounted_mountpoint_detection_distinguishes_local_from_offline_mounts() {
+        let active = vec![PathBuf::from("/"), PathBuf::from("/home"), PathBuf::from("/mnt/mounted")];
+        let fstab = vec![
+            PathBuf::from("/"),
+            PathBuf::from("/home"),
+            PathBuf::from("/media/nas"),
+        ];
+
+        assert!(!is_unmounted_mountpoint_from(
+            Path::new("/home/okarin/Music"),
+            &active,
+            &fstab
+        ));
+        assert!(!is_unmounted_mountpoint_from(
+            Path::new("/mnt/mounted"),
+            &active,
+            &fstab
+        ));
+        assert!(!is_unmounted_mountpoint_from(
+            Path::new("/mnt/mounted/Music"),
+            &active,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/mnt/usb"),
+            &active,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/run/media/okarin/DISK"),
+            &active,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/media/nas"),
+            &active,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/media/nas/Music"),
+            &active,
+            &fstab
+        ));
+    }
+
+    #[test]
+    fn safe_prune_removes_deleted_online_tracks_while_protecting_offline_roots() {
         let base = std::env::temp_dir().join(format!("rustygrade-prune-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
-        // An unmounted drive: the mount point exists but is empty.
-        let empty_mount = base.join("usb");
-        fs::create_dir_all(&empty_mount).unwrap();
-        let empty_mount = fs::canonicalize(&empty_mount).unwrap();
+        // Empty local folder (e.g. user deleted all tracks inside ~/Music/Emptied).
+        let emptied_local = base.join("local-music");
+        fs::create_dir_all(&emptied_local).unwrap();
+        let emptied_local = fs::canonicalize(&emptied_local).unwrap();
         // A root that is gone together with its parent.
         let absent = base.join("gone-parent").join("music");
-        // A healthy root with its file present.
+        // A healthy root with one present track and one deleted track.
         let healthy = base.join("ok");
         fs::create_dir_all(&healthy).unwrap();
         let healthy = fs::canonicalize(&healthy).unwrap();
         let present = healthy.join("01.flac");
+        let deleted_ok = healthy.join("02-deleted.flac");
         fs::write(&present, b"").unwrap();
 
-        let usb_track = empty_mount.join("Album").join("01.flac");
+        let local_gone_track = emptied_local.join("Album").join("01.flac");
         let absent_track = absent.join("Album").join("02.flac");
         let elsewhere = base.join("not-scanned").join("03.flac");
         let s = |p: &Path| p.to_string_lossy().into_owned();
         let mut library = LibraryMap::new();
-        library.insert("USB".to_owned(), album_with(&[&s(&usb_track)]));
+        library.insert("LocalEmptied".to_owned(), album_with(&[&s(&local_gone_track)]));
         library.insert("Absent".to_owned(), album_with(&[&s(&absent_track)]));
-        library.insert("Ok".to_owned(), album_with(&[&s(&present)]));
+        library.insert("Ok".to_owned(), album_with(&[&s(&present), &s(&deleted_ok)]));
         library.insert("Elsewhere".to_owned(), album_with(&[&s(&elsewhere)]));
 
         let mut by_path = HashMap::new();
@@ -1232,25 +1558,170 @@ mod tests {
                 by_path.insert(t.file_path.as_ref().unwrap().to_lowercase(), (key.clone(), idx));
             }
         }
-        let found = walk_paths(&[empty_mount.clone(), absent.clone(), healthy.clone()]);
+        let mut found = walk_paths(&[emptied_local.clone(), absent.clone(), healthy.clone()]);
+        // Simulate an unmounted external mountpoint directory alongside the scanned roots.
+        let unmounted = base.join("unmounted-usb");
+        let unmounted_track = unmounted.join("Album").join("04.flac");
+        library.insert("USB".to_owned(), album_with(&[&s(&unmounted_track)]));
+        by_path.insert(s(&unmounted_track).to_lowercase(), ("USB".to_owned(), 0));
+        found.walked_dirs.push(unmounted.clone());
+        found.suspect_empty_dirs.push(unmounted);
+
         let seen: HashSet<String> = found
             .files
             .iter()
             .map(|f| f.to_string_lossy().to_lowercase())
             .collect();
 
-        let mut gone = collect_missing(&library, &by_path, &found, &seen);
-        gone.sort();
-        let keys: Vec<&str> = gone.iter().map(|(_, k)| k.as_str()).collect();
-        assert_eq!(keys, vec!["Absent", "USB"]);
+        let missing_res = collect_missing(&library, &by_path, &found, &seen);
+        let mut safe_gone = missing_res.safe;
+        let mut suspect_gone = missing_res.suspect;
+        safe_gone.sort();
+        suspect_gone.sort();
+        let safe_keys: Vec<&str> = safe_gone.iter().map(|(_, k)| k.as_str()).collect();
+        let suspect_keys: Vec<&str> = suspect_gone.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(safe_keys, vec!["LocalEmptied", "Ok"]);
+        assert_eq!(suspect_keys, vec!["Absent", "USB"]);
 
+        // Safe prune drops only safe_gone.
         let mut touched = HashSet::new();
-        assert_eq!(prune_tracks(&mut library, &gone, &mut touched), 2);
-        assert!(library["USB"].tracks.as_ref().unwrap().is_empty());
-        assert!(library["Absent"].tracks.as_ref().unwrap().is_empty());
+        assert_eq!(prune_tracks(&mut library, &safe_gone, &mut touched), 2);
+        assert!(library["LocalEmptied"].tracks.as_ref().unwrap().is_empty());
         assert_eq!(library["Ok"].tracks.as_ref().unwrap().len(), 1);
+        assert_eq!(library["Absent"].tracks.as_ref().unwrap().len(), 1);
+        assert_eq!(library["USB"].tracks.as_ref().unwrap().len(), 1);
         assert_eq!(library["Elsewhere"].tracks.as_ref().unwrap().len(), 1);
-        assert!(touched.contains("USB") && touched.contains("Absent"));
+
+        // ForceAll prunes suspect_gone too.
+        assert_eq!(prune_tracks(&mut library, &suspect_gone, &mut touched), 2);
+        assert!(library["Absent"].tracks.as_ref().unwrap().is_empty());
+        assert!(library["USB"].tracks.as_ref().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_deduplicates_identical_covers_and_refcounts_on_prune() {
+        let base = std::env::temp_dir().join(format!("rustygrade-scan-dedup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let app_dir = base.join("app");
+        let music_dir = base.join("music");
+        let alb1_dir = music_dir.join("Alb1");
+        let alb2_dir = music_dir.join("Alb2");
+        fs::create_dir_all(&alb1_dir).unwrap();
+        fs::create_dir_all(&alb2_dir).unwrap();
+
+        fn minimal_flac_bytes() -> Vec<u8> {
+            let mut v = Vec::with_capacity(42);
+            v.extend_from_slice(b"fLaC");
+            v.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+            v.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+            v.extend_from_slice(&[0x00; 6]);
+            v.extend_from_slice(&[0x0A, 0xC4, 0x42, 0xF0, 0x00, 0x00, 0xAC, 0x44]);
+            v.extend_from_slice(&[0x00; 16]);
+            v
+        }
+
+        let t1 = alb1_dir.join("01.flac");
+        let t2 = alb2_dir.join("01.flac");
+        fs::write(&t1, minimal_flac_bytes()).unwrap();
+        fs::write(&t2, minimal_flac_bytes()).unwrap();
+        crate::tag_writer::TagWriter::write(
+            &t1,
+            &crate::tag_writer::TagEdit {
+                title: Some("Song 1".into()),
+                artist: Some("Artist".into()),
+                album: Some("Album One".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::tag_writer::TagWriter::write(
+            &t2,
+            &crate::tag_writer::TagEdit {
+                title: Some("Song 2".into()),
+                artist: Some("Artist".into()),
+                album: Some("Album Two".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(128, 128))
+            .write_to(&mut png_buf, image::ImageFormat::Png)
+            .unwrap();
+        let cover_bytes = png_buf.into_inner();
+        fs::write(alb1_dir.join("cover.png"), &cover_bytes).unwrap();
+        fs::write(alb2_dir.join("cover.png"), &cover_bytes).unwrap();
+
+        crate::paths::with_test_app_dir(&app_dir, || {
+            let res = Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Safe,
+                    max_threads: Some(1),
+                    force: false,
+                    resync_covers: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(res.added_tracks, 2);
+            assert_eq!(res.new_albums, 2);
+            assert_eq!(res.covers, 2);
+
+            let lib = LibraryStore::load_raw().unwrap();
+            let c1 = lib["Album One"].cover_art.clone().unwrap();
+            let c2 = lib["Album Two"].cover_art.clone().unwrap();
+            assert_eq!(c1, c2, "identical folder covers should share one content-addressed file");
+            assert_eq!(lib["Album One"].cover_art_full.as_ref(), Some(&c1));
+            let cover_files: Vec<_> = fs::read_dir(CoverPaths::cover_dir()).unwrap().flatten().collect();
+            assert_eq!(cover_files.len(), 1);
+            let cover_file_path = CoverPaths::to_local_path(Some(&c1)).unwrap();
+            assert!(cover_file_path.exists());
+
+            // Delete Album One's folder completely and rescan with PrunePolicy::Safe.
+            fs::remove_dir_all(&alb1_dir).unwrap();
+            let res2 = Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Safe,
+                    max_threads: Some(1),
+                    force: false,
+                    resync_covers: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(res2.removed_tracks, 1);
+            assert_eq!(res2.removed_albums, 1);
+            let lib2 = LibraryStore::load_raw().unwrap();
+            assert!(!lib2.contains_key("Album One"));
+            assert!(lib2.contains_key("Album Two"));
+            assert!(cover_file_path.exists(), "Album Two still references the shared cover");
+
+            // Delete Album Two's track (leaving music_dir completely empty) and rescan with Safe prune.
+            fs::remove_dir_all(&alb2_dir).unwrap();
+            let res3 = Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Safe,
+                    max_threads: Some(1),
+                    force: false,
+                    resync_covers: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(res3.removed_tracks, 1);
+            assert_eq!(res3.removed_albums, 1);
+            assert!(LibraryStore::load_raw().unwrap().is_empty());
+            assert!(!cover_file_path.exists(), "shared cover should be removed once all albums are gone");
+        });
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1271,5 +1742,294 @@ mod tests {
         assert!(files[0].ends_with("track.flac"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_mountinfo_and_fstab_handle_escapes_comments_and_trailing_slashes() {
+        let mountinfo = "\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+23 22 8:2 / /mnt/My\\040Drive/ rw - exfat /dev/sdb1 rw
+24 22 0:19 / /media/usb\\011tab rw - vfat /dev/sdc1 rw
+";
+        let mounts = parse_mountinfo(mountinfo);
+        assert_eq!(
+            mounts,
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/mnt/My Drive"),
+                PathBuf::from("/media/usb\ttab"),
+            ]
+        );
+
+        let fstab = "\
+# comment line
+UUID=1234 / ext4 defaults 0 1
+UUID=5678 none swap sw 0 0
+UUID=90ab /srv/music\\040lib/ ext4 noauto,user 0 0
+//nas/share /mnt/Nas\\134Share cifs noauto 0 0
+badline
+";
+        let fstab_mounts = parse_fstab(fstab);
+        assert_eq!(
+            fstab_mounts,
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/srv/music lib"),
+                PathBuf::from("/mnt/Nas\\Share"),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_unmounted_mountpoint_checks_mount_roots_directly() {
+        let active_none = vec![PathBuf::from("/")];
+        let active_usb = vec![PathBuf::from("/"), PathBuf::from("/mnt/usb")];
+        let fstab = vec![PathBuf::from("/"), PathBuf::from("/srv/cold")];
+
+        // `/mnt`, `/media`, `/run/media` directly have no active mounts underneath -> suspect.
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/mnt"),
+            &active_none,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/media"),
+            &active_none,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/run/media"),
+            &active_none,
+            &fstab
+        ));
+
+        // Once `/mnt/usb` is active underneath `/mnt`, `/mnt` itself sees an active child mount.
+        assert!(!is_unmounted_mountpoint_from(
+            Path::new("/mnt"),
+            &active_usb,
+            &fstab
+        ));
+        assert!(!is_unmounted_mountpoint_from(
+            Path::new("/mnt/usb"),
+            &active_usb,
+            &fstab
+        ));
+        assert!(!is_unmounted_mountpoint_from(
+            Path::new("/mnt/usb/Music"),
+            &active_usb,
+            &fstab
+        ));
+
+        // Sibling `/mnt/other` without its own active mount remains suspect.
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/mnt/other"),
+            &active_usb,
+            &fstab
+        ));
+        // Unmounted fstab entry and nested folder under it are suspect; active mount isn't.
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/srv/cold"),
+            &active_usb,
+            &fstab
+        ));
+        assert!(is_unmounted_mountpoint_from(
+            Path::new("/srv/cold/Jazz"),
+            &active_usb,
+            &fstab
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_protects_nested_unreadable_subdirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("rustygrade-sym-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let real_root = base.join("real");
+        let unreadable_sub = real_root.join("LockedAlbum");
+        let link_root = base.join("link_music");
+        fs::create_dir_all(&unreadable_sub).unwrap();
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        fs::set_permissions(&unreadable_sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = fs::read_dir(&unreadable_sub).is_err();
+        if locked {
+            let found = walk_paths(std::slice::from_ref(&link_root));
+            let raw_locked = link_root.join("LockedAlbum");
+            let canon_locked = fs::canonicalize(&real_root).unwrap().join("LockedAlbum");
+            assert!(
+                found.unreadable_dirs.contains(&raw_locked),
+                "expected raw aliased locked dir in {:?}",
+                found.unreadable_dirs
+            );
+            assert!(found.unreadable_dirs.contains(&canon_locked));
+
+            let mut lib = LibraryMap::new();
+            let raw_track = raw_locked.join("01.flac");
+            let s_raw = raw_track.to_string_lossy().into_owned();
+            lib.insert(
+                "Locked".to_owned(),
+                AlbumDto {
+                    tracks: Some(vec![TrackDto {
+                        file_path: Some(s_raw.clone()),
+                        ..TrackDto::default()
+                    }]),
+                    ..AlbumDto::default()
+                },
+            );
+            let mut by_path = HashMap::new();
+            by_path.insert(s_raw.to_lowercase(), ("Locked".to_owned(), 0));
+            let missing = collect_missing(&lib, &by_path, &found, &HashSet::new());
+            assert!(missing.safe.is_empty());
+            assert!(missing.suspect.is_empty());
+        }
+        let _ = fs::set_permissions(&unreadable_sub, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_resync_covers_preserves_unextractable_and_refcounts_replacements() {
+        let base = std::env::temp_dir().join(format!("rustygrade-resync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let app_dir = base.join("app");
+        let music_dir = base.join("music");
+        let d1 = music_dir.join("Alb1");
+        let d2 = music_dir.join("Alb2");
+        let d3 = music_dir.join("Alb3");
+        fs::create_dir_all(&d1).unwrap();
+        fs::create_dir_all(&d2).unwrap();
+        fs::create_dir_all(&d3).unwrap();
+
+        fn minimal_flac_bytes() -> Vec<u8> {
+            let mut v = Vec::with_capacity(42);
+            v.extend_from_slice(b"fLaC");
+            v.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+            v.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+            v.extend_from_slice(&[0x00; 6]);
+            v.extend_from_slice(&[0x0A, 0xC4, 0x42, 0xF0, 0x00, 0x00, 0xAC, 0x44]);
+            v.extend_from_slice(&[0x00; 16]);
+            v
+        }
+
+        fn solid_png(r: u8, g: u8, b: u8) -> Vec<u8> {
+            let mut img = image::RgbImage::new(64, 64);
+            for p in img.pixels_mut() {
+                *p = image::Rgb([r, g, b]);
+            }
+            let mut cur = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cur, image::ImageFormat::Png)
+                .unwrap();
+            cur.into_inner()
+        }
+
+        for (dir, title, album) in [
+            (&d1, "S1", "Resync One"),
+            (&d2, "S2", "Resync Two"),
+            (&d3, "S3", "Resync Three"),
+        ] {
+            let t = dir.join("01.flac");
+            fs::write(&t, minimal_flac_bytes()).unwrap();
+            crate::tag_writer::TagWriter::write(
+                &t,
+                &crate::tag_writer::TagEdit {
+                    title: Some(title.into()),
+                    artist: Some("Artist".into()),
+                    album: Some(album.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let shared_png = solid_png(200, 20, 20);
+        let unique_png = solid_png(20, 200, 20);
+        let replacement_png = solid_png(20, 20, 200);
+        fs::write(d1.join("cover.png"), &shared_png).unwrap();
+        fs::write(d2.join("cover.png"), &shared_png).unwrap();
+        fs::write(d3.join("cover.png"), &unique_png).unwrap();
+
+        crate::paths::with_test_app_dir(&app_dir, || {
+            Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Safe,
+                    max_threads: Some(1),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+            let lib_before = LibraryStore::load_raw().unwrap();
+            let shared_url = lib_before["Resync One"].cover_art.clone().unwrap();
+            assert_eq!(shared_url, lib_before["Resync Two"].cover_art.clone().unwrap());
+            let unique_url = lib_before["Resync Three"].cover_art.clone().unwrap();
+            let shared_file = CoverPaths::to_local_path(Some(&shared_url)).unwrap();
+            let unique_file = CoverPaths::to_local_path(Some(&unique_url)).unwrap();
+
+            // Replace Alb1's cover, keep Alb2's shared cover, and delete Alb3's source image.
+            fs::write(d1.join("cover.png"), &replacement_png).unwrap();
+            fs::remove_file(d3.join("cover.png")).unwrap();
+
+            // Cancelled resync must leave covers intact.
+            let cancelled = AtomicBool::new(true);
+            Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Never,
+                    max_threads: Some(1),
+                    resync_covers: true,
+                    ..Default::default()
+                },
+                Some(&cancelled),
+                None,
+            )
+            .unwrap();
+            let lib_after_cancel = LibraryStore::load_raw().unwrap();
+            assert_eq!(lib_after_cancel["Resync One"].cover_art.as_ref(), Some(&shared_url));
+
+            // Full cover resync updates Alb1, keeps Alb2's shared file, and preserves Alb3's cover.
+            let res = Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Never,
+                    max_threads: Some(1),
+                    resync_covers: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(res.covers, 2);
+
+            let lib_after = LibraryStore::load_raw().unwrap();
+            let new_url_1 = lib_after["Resync One"].cover_art.clone().unwrap();
+            assert_ne!(new_url_1, shared_url);
+            assert!(shared_file.exists(), "Alb2 still keeps shared file alive");
+            assert_eq!(lib_after["Resync Three"].cover_art.as_ref(), Some(&unique_url));
+            assert!(unique_file.exists(), "unextractable cover must be preserved");
+
+            // Now replace Alb2's cover too; old shared_file must be deleted once no longer referenced.
+            fs::write(d2.join("cover.png"), &replacement_png).unwrap();
+            Scanner::scan(
+                std::slice::from_ref(&music_dir),
+                ScanOptions {
+                    prune: PrunePolicy::Never,
+                    max_threads: Some(1),
+                    resync_covers: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!shared_file.exists(), "replaced unique/shared file should be deleted once unreferenced");
+        });
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

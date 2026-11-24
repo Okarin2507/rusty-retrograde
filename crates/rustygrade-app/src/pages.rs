@@ -125,14 +125,14 @@ impl App {
     pub fn open_album(&mut self, key: crate::AlbumKey) -> Task<Message> {
         let mut cover = None;
         if let Some(album) = self.find_album(&key) {
-            let full = album.cover_full_path.clone();
             let thumb = album.cover_thumb_path.clone();
+            let full = album.cover_full_path.clone();
             cover = thumb.clone().or(full.clone());
-            if let Some(p) = full {
-                self.covers.ensure_full(&p);
-            }
             if let Some(p) = thumb {
                 self.covers.ensure_thumb(&p);
+            }
+            if let Some(p) = full {
+                self.covers.ensure_full(&p);
             }
         }
         self.detail_scroll_y = 0.0;
@@ -254,7 +254,34 @@ impl App {
                 .find(|p| p.id == *id)
                 .map(|p| p.track_ids.iter().filter_map(|t| self.lookup_track(t).cloned()).collect())
                 .unwrap_or_default(),
-            DetailCtx::Playlist(PlaylistView::Smart(_)) => self.cached_smart_tracks.clone(),
+            DetailCtx::Playlist(PlaylistView::Smart(id)) => {
+                if self.playlist_view == PlaylistView::Smart(*id) {
+                    self.cached_smart_tracks.clone()
+                } else {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    self.collections
+                        .smart
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .find(|s| s.id == *id)
+                        .map(|sp| {
+                            rustygrade_core::SmartPlaylists::evaluate(
+                                sp,
+                                self.albums
+                                    .iter()
+                                    .flat_map(|a| a.tracks.iter().map(move |t| (t, a))),
+                                |tid| self.stats.get(tid),
+                                |tid| self.liked_set.contains(tid),
+                                now_ms,
+                            )
+                        })
+                        .unwrap_or_default()
+                }
+            }
         }
     }
 }
@@ -1305,7 +1332,16 @@ pub fn playlist_page<'a>(app: &'a App, accent: Color) -> Element<'a, Message> {
         Option<i64>,
         Option<Element<'a, Message>>,
     ) = match view {
-        PlaylistView::Liked => ("PLAYLIST_DATA", "FAVORITES".to_owned(), liked_tint, true, None, None),
+        PlaylistView::Liked => {
+            let extra: Element<'a, Message> = context_menu::left_trigger(
+                button(icons::icon("more", 26.0, theme::TEXT_DIM))
+                    .padding(6)
+                    .style(theme::bare_button_style())
+                    .on_press(Message::Noop),
+                move |pos| Message::OpenDetailMenu(DetailCtx::Playlist(PlaylistView::Liked), pos),
+            );
+            ("PLAYLIST_DATA", "FAVORITES".to_owned(), liked_tint, true, None, Some(extra))
+        }
         PlaylistView::Custom(id) => {
             let name = app.collections.playlists.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();
             let all_liked = !tracks.is_empty() && tracks.iter().all(|t| app.liked_set.contains(&t.id));
@@ -1566,7 +1602,9 @@ pub fn search_page<'a>(app: &'a App, accent: Color) -> Element<'a, Message> {
                     };
                     let card = media_card("PL", name.clone(), format!("{n} TRACKS"), cover, name, card_h, accent, Message::OpenPlaylistPage(*view));
                     if let PlaylistView::Custom(pid) = *view {
-                        context_menu::trigger(card, move |pos| Message::OpenPlaylistMenu(pid, pos))
+                        context_menu::trigger(card, move |pos| {
+                            Message::OpenPlaylistMenu(PlaylistView::Custom(pid), pos)
+                        })
                     } else {
                         card
                     }

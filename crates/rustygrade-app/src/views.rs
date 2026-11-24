@@ -196,6 +196,7 @@ pub fn render_app(app: &App) -> Element<'_, Message> {
             vec![
                 ("NEW_PLAYLIST", false, Message::ToggleCreatePlaylist(true)),
                 ("NEW_SMART_PLAYLIST", false, Message::NewSmartPlaylist),
+                ("IMPORT_PLAYLIST", false, Message::ImportPlaylistPick),
             ],
             184.0,
         );
@@ -840,7 +841,7 @@ fn view_sidebar(app: &App, accent: Color) -> Element<'_, Message> {
     };
     let list_pad = if rail { Padding::ZERO } else { Padding::ZERO.right(10.0) };
     let list_content: Element<'_, Message> = if app.bank_playlists {
-        let mut v: Vec<Element<'_, Message>> = vec![bank_row_icon(
+        let fav_item = bank_row_icon(
             icons::icon("heart", 12.0, theme::GOLD),
             "FAVORITES",
             format!("{} UNITS", app.collections.liked.len()),
@@ -848,18 +849,25 @@ fn view_sidebar(app: &App, accent: Color) -> Element<'_, Message> {
             accent,
             rail,
             Message::OpenPlaylistPage(PlaylistView::Liked),
-        )];
+        );
+        let mut v: Vec<Element<'_, Message>> = vec![context_menu::trigger(fav_item, |pos| {
+            Message::OpenPlaylistMenu(PlaylistView::Liked, pos)
+        })];
         for sp in app.collections.smart.iter().flatten() {
-            let cnt = app.smart_counts.get(&sp.id).copied().unwrap_or(0);
-            v.push(bank_row_icon(
+            let sid = sp.id;
+            let cnt = app.smart_counts.get(&sid).copied().unwrap_or(0);
+            let smart_item = bank_row_icon(
                 icons::icon("filter", 13.0, theme::TEAL),
                 &sp.name,
                 format!("{cnt} UNITS"),
-                tab == Tab::Playlists && app.playlist_view == PlaylistView::Smart(sp.id),
+                tab == Tab::Playlists && app.playlist_view == PlaylistView::Smart(sid),
                 accent,
                 rail,
-                Message::OpenPlaylistPage(PlaylistView::Smart(sp.id)),
-            ));
+                Message::OpenPlaylistPage(PlaylistView::Smart(sid)),
+            );
+            v.push(context_menu::trigger(smart_item, move |pos| {
+                Message::OpenPlaylistMenu(PlaylistView::Smart(sid), pos)
+            }));
         }
         for p in &app.collections.playlists {
             let pid = p.id;
@@ -898,7 +906,9 @@ fn view_sidebar(app: &App, accent: Color) -> Element<'_, Message> {
                 rail,
                 Message::OpenPlaylistPage(PlaylistView::Custom(pid)),
             );
-            v.push(context_menu::trigger(item, move |pos| Message::OpenPlaylistMenu(pid, pos)));
+            v.push(context_menu::trigger(item, move |pos| {
+                Message::OpenPlaylistMenu(PlaylistView::Custom(pid), pos)
+            }));
         }
         column(v).spacing(SIDEBAR_ALBUM_GAP).padding(list_pad).into()
     } else {
@@ -2451,10 +2461,60 @@ fn view_settings(app: &App, accent: Color) -> Element<'_, Message> {
         .into(),
     );
 
+    let mode_chip = |label: &'static str, on: bool, msg: Message| {
+        button(text(label).size(10).font(bold()))
+            .padding([5, 12])
+            .style(theme::chip_style(on))
+            .on_press(msg)
+    };
+    let mode_hint = if app.backup_import_replace {
+        "Replaces all playlists, favorites & smart rules (confirms first)"
+    } else {
+        "Merges into existing collections without overwriting local IDs"
+    };
+    let playlists_backup = orbit_section(
+        "PLAYLISTS_&_BACKUP",
+        theme::TEAL,
+        column![
+            setting_row(
+                "ZIP IMPORT MODE",
+                "Controls whether importing a .zip backup merges with local playlists and favorites or replaces them after confirmation.",
+                theme::TEAL,
+                row![
+                    mode_chip("MERGE", !app.backup_import_replace, Message::SetBackupImportReplace(false)),
+                    mode_chip("REPLACE", app.backup_import_replace, Message::SetBackupImportReplace(true)),
+                    text(mode_hint)
+                        .size(11)
+                        .color(if app.backup_import_replace { theme::ORANGE } else { theme::TEXT_MUTE }),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into(),
+            ),
+            row![
+                button(text("EXPORT COLLECTIONS (.ZIP)").size(11).font(bold()))
+                    .padding([7, 14])
+                    .style(theme::accent_button_style(accent))
+                    .on_press(Message::ExportCollectionsZipPick),
+                button(text("IMPORT PLAYLIST / BACKUP").size(11).font(bold()))
+                    .padding([7, 14])
+                    .style(theme::ghost_button_style(false, accent))
+                    .on_press(Message::ImportBackupFromSettingsPick),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .into(),
+    );
+
     smooth(
-        scrollable(column![telemetry, graphics, audio_sys, artwork_apis, library].spacing(16).padding(Padding::ZERO.right(10.0)))
-            .width(Length::Fill)
-            .height(Length::Fill),
+        scrollable(
+            column![telemetry, graphics, audio_sys, artwork_apis, library, playlists_backup]
+                .spacing(16)
+                .padding(Padding::ZERO.right(10.0)),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill),
     )
 }
 

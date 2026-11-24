@@ -6,7 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crc32fast.workspace = true
 fast_image_resize.workspace = true
+flate2.workspace = true
 image.workspace = true
 lofty.workspace = true
 notify.workspace = true

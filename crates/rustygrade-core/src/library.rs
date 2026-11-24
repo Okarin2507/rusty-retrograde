@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-
-use indexmap::IndexMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::collections::CollectionsStore;
+use crate::covers::delete_unreferenced_covers;
 use crate::models::{Album, Track};
 use crate::paths::CoverPaths;
 
@@ -149,15 +150,24 @@ impl LibraryStore {
         let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
         let mut library = Self::load_raw()?;
         let mut removed = 0;
+        let mut detached = Vec::new();
         for name in names {
-            if library.shift_remove(name).is_some() {
+            if let Some(album) = library.shift_remove(name) {
                 removed += 1;
-                try_delete(&CoverPaths::thumb_path(name));
-                try_delete(&CoverPaths::full_path(name));
+                if let Some(p) = CoverPaths::to_local_path(album.cover_art.as_deref()) {
+                    detached.push(p);
+                }
+                if let Some(p) = CoverPaths::to_local_path(album.cover_art_full.as_deref()) {
+                    detached.push(p);
+                }
+                detached.push(CoverPaths::thumb_path(name));
+                detached.push(CoverPaths::full_path(name));
             }
         }
         if removed > 0 {
             Self::save_raw(&library)?;
+            let collections = CollectionsStore::load();
+            delete_unreferenced_covers(&detached, &library, &collections);
         }
         Ok(removed)
     }
@@ -181,98 +191,31 @@ impl LibraryStore {
         let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
         let mut library = Self::load_raw()?;
         let mut changed = false;
+        let mut detached = Vec::new();
         for name in names {
             if let Some(album) = library.get_mut(name) {
+                if let Some(p) = CoverPaths::to_local_path(album.cover_art.as_deref()) {
+                    detached.push(p);
+                }
+                if let Some(p) = CoverPaths::to_local_path(album.cover_art_full.as_deref()) {
+                    detached.push(p);
+                }
+                detached.push(CoverPaths::thumb_path(name));
+                detached.push(CoverPaths::full_path(name));
                 album.cover_art = None;
                 album.cover_art_full = None;
-                try_delete(&CoverPaths::thumb_path(name));
-                try_delete(&CoverPaths::full_path(name));
                 changed = true;
             }
         }
         if changed {
             Self::save_raw(&library)?;
+            let collections = CollectionsStore::load();
+            delete_unreferenced_covers(&detached, &library, &collections);
         }
         Ok(())
     }
 
-    /// Settings → RESYNC COVERS, step 1: forgets every album cover so the next scan extracts it
-    /// again from the files (embedded picture or folder image). The cover files are moved aside, not
-    /// deleted, so [`Self::restore_stashed_covers`] can put back any the scan could not rebuild.
-    /// Albums with no track file left on disk are skipped, since a scan could not rebuild them.
-    pub fn stash_all_covers() -> Result<Vec<StashedCover>, LibraryError> {
-        Self::recover_stashed_covers()?;
-        let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
-        let mut library = Self::load_raw()?;
-        let mut stashed = Vec::new();
-        for (name, album) in library.iter_mut() {
-            let has_cover = album.cover_art.as_deref().is_some_and(|c| !c.is_empty())
-                || album.cover_art_full.as_deref().is_some_and(|c| !c.is_empty());
-            let rebuildable = album
-                .tracks
-                .iter()
-                .flatten()
-                .filter_map(|t| t.file_path.as_deref())
-                .any(|p| Path::new(p).is_file());
-            if !has_cover || !rebuildable {
-                continue;
-            }
-            for path in [CoverPaths::thumb_path(name), CoverPaths::full_path(name)] {
-                if path.exists() {
-                    let _ = fs::rename(&path, stash_path(&path));
-                }
-            }
-            stashed.push(StashedCover {
-                album: name.clone(),
-                cover_art: album.cover_art.take(),
-                cover_art_full: album.cover_art_full.take(),
-            });
-        }
-        if !stashed.is_empty() {
-            Self::save_raw(&library)?;
-        }
-        Ok(stashed)
-    }
-
-    /// RESYNC COVERS, step 2 (after the scan, whatever its outcome): albums that got a new cover
-    /// drop their stashed files; albums still without one get their old cover back. Returns how
-    /// many were restored.
-    pub fn restore_stashed_covers(stashed: Vec<StashedCover>) -> Result<usize, LibraryError> {
-        let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
-        let mut library = Self::load_raw()?;
-        let mut restored = 0;
-        for s in stashed {
-            let files = [CoverPaths::thumb_path(&s.album), CoverPaths::full_path(&s.album)];
-            let album = library.get_mut(&s.album);
-            let needs_old = album
-                .as_ref()
-                .is_some_and(|a| a.cover_art.as_deref().unwrap_or("").is_empty());
-            for path in &files {
-                let old = stash_path(path);
-                if needs_old && !path.exists() {
-                    let _ = fs::rename(&old, path);
-                } else {
-                    try_delete(&old);
-                }
-            }
-            if needs_old && let Some(album) = album {
-                album.cover_art = s.cover_art;
-                album.cover_art_full = s.cover_art_full;
-                restored += 1;
-            }
-        }
-        if restored > 0 {
-            Self::save_raw(&library)?;
-        }
-        Ok(restored)
-    }
-}
-
-impl LibraryStore {
-    /// Undoes a resync that never reached [`Self::restore_stashed_covers`] (app killed, panic):
-    /// every `*.resync-old` cover goes back where it was unless a new cover took its place, and
-    /// albums left with empty cover fields point at their cover files again. Run at startup and
-    /// before each resync.
+    /// Undoes a resync from older builds that created `*.resync-old` cover backups. Run at startup.
     pub fn recover_stashed_covers() -> Result<usize, LibraryError> {
         let Ok(entries) = fs::read_dir(CoverPaths::cover_dir()) else {
             return Ok(0);
@@ -313,20 +256,6 @@ impl LibraryStore {
         }
         Ok(fixed)
     }
-}
-
-/// An album cover set aside by [`LibraryStore::stash_all_covers`].
-#[derive(Debug, Clone)]
-pub struct StashedCover {
-    album: String,
-    cover_art: Option<String>,
-    cover_art_full: Option<String>,
-}
-
-fn stash_path(cover: &Path) -> PathBuf {
-    let mut name = cover.as_os_str().to_owned();
-    name.push(".resync-old");
-    PathBuf::from(name)
 }
 
 pub(crate) fn try_delete(path: &Path) {
@@ -469,7 +398,10 @@ fn de_f64_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::reorder_by_ids;
+    use super::*;
+    use crate::covers::save_cover_bytes;
+    use image::{DynamicImage, ImageFormat};
+    use std::io::Cursor;
 
     #[test]
     fn reorder_by_ids_puts_listed_first_and_keeps_the_rest() {
@@ -477,5 +409,47 @@ mod tests {
         let ids: Vec<String> = ["d", "x", "b", "a"].iter().map(|s| s.to_string()).collect();
         reorder_by_ids(&mut v, &ids, |s| Some(*s));
         assert_eq!(v, ["d", "b", "a", "c", "e"]);
+    }
+
+    #[test]
+    fn delete_albums_preserves_shared_cover_until_last_reference_is_removed() {
+        let dir = std::env::temp_dir().join(format!("retro-lib-del-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::paths::with_test_app_dir(&dir, || {
+            let mut png = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(image::RgbImage::new(64, 64))
+                .write_to(&mut png, ImageFormat::Png)
+                .unwrap();
+            let cover_path = save_cover_bytes(&png.into_inner()).unwrap();
+            let cover_url = CoverPaths::to_file_url(&cover_path);
+
+            let mut lib = LibraryMap::new();
+            lib.insert(
+                "Album 1".to_owned(),
+                AlbumDto {
+                    name: Some("Album 1".to_owned()),
+                    cover_art: Some(cover_url.clone()),
+                    cover_art_full: Some(cover_url.clone()),
+                    ..Default::default()
+                },
+            );
+            lib.insert(
+                "Album 2".to_owned(),
+                AlbumDto {
+                    name: Some("Album 2".to_owned()),
+                    cover_art: Some(cover_url.clone()),
+                    cover_art_full: Some(cover_url),
+                    ..Default::default()
+                },
+            );
+            LibraryStore::save_raw(&lib).unwrap();
+
+            assert_eq!(LibraryStore::delete_albums(&["Album 1".to_owned()]).unwrap(), 1);
+            assert!(cover_path.exists(), "Album 2 still references the shared cover");
+
+            assert_eq!(LibraryStore::delete_albums(&["Album 2".to_owned()]).unwrap(), 1);
+            assert!(!cover_path.exists(), "shared cover must be removed when last album is deleted");
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }

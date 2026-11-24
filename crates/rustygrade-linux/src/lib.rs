@@ -21,7 +21,10 @@ pub use gpu_policy::{
 };
 pub use malloc_tuning::limit_malloc_arenas;
 pub use mpris::{MprisCommand, MprisService, MprisState};
-pub use portal::{pick_cover_image, pick_music_files, pick_music_folders};
+pub use portal::{
+    pick_cover_image, pick_music_files, pick_music_folders, pick_playlist_export_file,
+    pick_playlist_import_file,
+};
 pub use power_profile::{PowerProfile, PowerProfileMonitor, RenderTier};
 pub use single_instance::{SingleInstance, SingleInstanceCommand, SingleInstanceGuard, SingleInstanceOutcome};
 pub use tray::{TrayCommand, TrayService, TrayToggles};

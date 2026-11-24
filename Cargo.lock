@@ -3524,7 +3524,9 @@ dependencies = [
 name = "rustygrade-core"
 version = "1.0.1"
 dependencies = [
+ "crc32fast",
  "fast_image_resize",
+ "flate2",
  "image",
  "indexmap",
  "lofty",

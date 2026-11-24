@@ -16,11 +16,13 @@ use crate::Message;
 pub enum ConfirmAction {
     /// Scan these roots again and drop the tracks whose files are gone.
     PruneMissing(Vec<PathBuf>),
-    /// Delete a playlist and its own cover files (`cover_art`).
-    DeletePlaylist { id: i64, cover_art: Option<String> },
+    /// Delete a playlist and its unreferenced cover files.
+    DeletePlaylist(i64),
     DeleteSmartPlaylist(i64),
     /// Delete the named albums from `library.json`.
     DeleteAlbums(Vec<String>),
+    /// Replace all collections (playlists, favorites, smart playlists) from a `.zip` backup.
+    ReplaceCollectionsZip(PathBuf),
 }
 
 #[derive(Debug, Clone)]

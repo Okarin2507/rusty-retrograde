@@ -36,18 +36,19 @@ use rustygrade_audio::AudioPath;
 use rustygrade_core::{
     Album, AppSettings, ArtistSummary, CollectionsData, CoverPalette, CoverPaths,
     DirectVolumeBridge, DisplayBackend, ExtraMap, GpuPreference, LyricsDoc, PerformanceMode,
-    PlayStats, SmartPlaylistData, SmartPlaylists, SmartRule, TagEdit, Track,
+    PlayStats, SmartPlaylistData, SmartPlaylists, SmartRule, TagEdit, Track, ZipArchiveSummary,
+    inspect_backup_zip_file, suggest_export_filename,
 };
 use rustygrade_linux::{
     ArtworkProviders, DiscordRpcStatus, GraphicsPolicyReport, PowerProfile, RenderTier,
     SingleInstance, SingleInstanceOutcome, apply_startup_graphics_policy, pick_cover_image,
-    pick_music_files, pick_music_folders,
+    pick_music_files, pick_music_folders, pick_playlist_export_file, pick_playlist_import_file,
 };
 use tokio::sync::mpsc;
 
 use crate::controller::{
     ControllerCommand, ControllerEvent, DeviceOption, NoticeKind, PlaybackTickMode,
-    StartupContext, WindowAction, run_coordinator,
+    PlaylistExportTarget, StartupContext, WindowAction, run_coordinator,
 };
 use crate::covers_ui::CoverCache;
 use crate::library_view::{
@@ -411,8 +412,19 @@ pub enum Message {
         pos: Point,
     },
     OpenAlbumMenu(AlbumKey, Point),
-    OpenPlaylistMenu(i64, Point),
+    OpenPlaylistMenu(PlaylistView, Point),
     OpenDetailMenu(pages::DetailCtx, Point),
+    ImportPlaylistPick,
+    ImportBackupFromSettingsPick,
+    PlaylistImportPicked(bool, Result<Option<PathBuf>, String>),
+    ZipReplaceInspected(PathBuf, Result<ZipArchiveSummary, String>),
+    SetBackupImportReplace(bool),
+    ExportCollectionsZipPick,
+    CollectionsZipExportPicked(Result<Option<PathBuf>, String>),
+    ContextExportPlaylistM3u8(PlaylistView),
+    PlaylistM3u8ExportPicked(PlaylistExportTarget, Result<Option<PathBuf>, String>),
+    ContextExportPlaylistZip(i64),
+    PlaylistZipExportPicked(i64, Result<Option<PathBuf>, String>),
     CloseContextMenu,
     ContextToggleLike(String),
     ContextToggleLikeTracks(Vec<String>),
@@ -634,6 +646,7 @@ pub struct App {
     pub bg_remember: bool,
     pub sort_menu_open: bool,
     pub bank_menu_open: bool,
+    pub backup_import_replace: bool,
     /// Main window size, for the grid columns and the queue popup height.
     pub window_size: iced::Size,
     /// The page whose cover color was last asked for, and the track whose backdrop was last blurred.
@@ -1204,6 +1217,7 @@ impl App {
             bg_remember: false,
             sort_menu_open: false,
             bank_menu_open: false,
+            backup_import_replace: false,
             window_size: iced::Size::new(1200.0, 800.0),
             tint_for: None,
             fs_blur_tried: None,
@@ -2269,7 +2283,7 @@ impl App {
                         detail: None,
                         note: "ACTION CANNOT BE UNDONE.",
                         confirm: "CONFIRM",
-                        action: dialogs::ConfirmAction::DeletePlaylist { id, cover_art: p.cover_art.clone() },
+                        action: dialogs::ConfirmAction::DeletePlaylist(id),
                     });
                 }
                 Task::none()
@@ -2366,12 +2380,193 @@ impl App {
                 });
                 Task::none()
             }
-            Message::OpenPlaylistMenu(id, pos) => {
+            Message::OpenPlaylistMenu(view, pos) => {
+                let tracks = self.detail_tracks(&pages::DetailCtx::Playlist(view));
                 self.context_menu = Some(context_menu::ContextMenu {
                     pos,
-                    kind: context_menu::ContextMenuKind::Playlist(id),
+                    kind: context_menu::ContextMenuKind::Playlist { view, tracks },
                 });
                 Task::none()
+            }
+            Message::ImportPlaylistPick => {
+                self.bank_menu_open = false;
+                Task::perform(pick_playlist_import_file(), |res| {
+                    Message::PlaylistImportPicked(false, res)
+                })
+            }
+            Message::ImportBackupFromSettingsPick => {
+                Task::perform(pick_playlist_import_file(), |res| {
+                    Message::PlaylistImportPicked(true, res)
+                })
+            }
+            Message::PlaylistImportPicked(from_settings, Ok(Some(path))) => {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase);
+                match ext.as_deref() {
+                    Some("m3u" | "m3u8") => {
+                        let _ = self
+                            .cmd_tx
+                            .send(ControllerCommand::ImportPlaylistM3u { path });
+                        Task::none()
+                    }
+                    Some("zip") => {
+                        let replace = from_settings && self.backup_import_replace;
+                        if replace {
+                            let inspect_path = path.clone();
+                            Task::perform(
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        inspect_backup_zip_file(&inspect_path)
+                                            .map_err(|e| e.to_string())
+                                    })
+                                    .await
+                                    .map_err(|e| format!("Archive inspection failed: {e}"))?
+                                },
+                                move |res| Message::ZipReplaceInspected(path.clone(), res),
+                            )
+                        } else {
+                            let _ = self.cmd_tx.send(ControllerCommand::ImportCollectionsZip {
+                                path,
+                                replace: false,
+                            });
+                            Task::none()
+                        }
+                    }
+                    _ => self.toasts.push(
+                        NoticeKind::Error,
+                        "UNSUPPORTED_FILE // EXPECTED .m3u8, .m3u, OR .zip".to_owned(),
+                    ),
+                }
+            }
+            Message::ZipReplaceInspected(path, Ok(summary)) => {
+                if summary.is_single_playlist_export {
+                    let _ = self.cmd_tx.send(ControllerCommand::ImportCollectionsZip {
+                        path,
+                        replace: false,
+                    });
+                    return self.toasts.push(
+                        NoticeKind::Info,
+                        "SINGLE_PLAYLIST_ARCHIVE // IMPORTED IN MERGE MODE TO PROTECT COLLECTIONS"
+                            .to_owned(),
+                    );
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("archive.zip")
+                    .to_owned();
+                let note = if !summary.has_collections && summary.has_stats {
+                    "PLAY STATS WILL BE REPLACED."
+                } else if summary.has_stats {
+                    "ALL PLAYLISTS, FAVORITES, SMART RULES & PLAY STATS WILL BE REPLACED."
+                } else {
+                    "ALL PLAYLISTS, FAVORITES & SMART RULES WILL BE REPLACED."
+                };
+                self.confirm = Some(dialogs::ConfirmDialog {
+                    title: "WARNING: REPLACE_COLLECTIONS",
+                    target_label: "ARCHIVE: ",
+                    target: name,
+                    target_orange: true,
+                    detail: Some(format_zip_replace_detail(&summary)),
+                    note,
+                    confirm: "REPLACE",
+                    action: dialogs::ConfirmAction::ReplaceCollectionsZip(path),
+                });
+                Task::none()
+            }
+            Message::ZipReplaceInspected(_, Err(err)) => {
+                self.toasts.push(NoticeKind::Error, format!("IMPORT_FAILED // {err}"))
+            }
+            Message::PlaylistImportPicked(_, Ok(None)) => Task::none(),
+            Message::PlaylistImportPicked(_, Err(err)) => self.toasts.push(NoticeKind::Error, err),
+            Message::SetBackupImportReplace(replace) => {
+                self.backup_import_replace = replace;
+                Task::none()
+            }
+            Message::ExportCollectionsZipPick => {
+                Task::perform(
+                    pick_playlist_export_file("retrograde-collections.zip".to_owned(), true),
+                    Message::CollectionsZipExportPicked,
+                )
+            }
+            Message::CollectionsZipExportPicked(Ok(Some(dest))) => {
+                let _ = self
+                    .cmd_tx
+                    .send(ControllerCommand::ExportCollectionsZip { dest });
+                Task::none()
+            }
+            Message::CollectionsZipExportPicked(Ok(None)) => Task::none(),
+            Message::CollectionsZipExportPicked(Err(err)) => {
+                self.toasts.push(NoticeKind::Error, err)
+            }
+            Message::ContextExportPlaylistM3u8(view) => {
+                self.context_menu = None;
+                let (target, raw_name) = match view {
+                    PlaylistView::Liked => (PlaylistExportTarget::Liked, "Favorites"),
+                    PlaylistView::Custom(id) => {
+                        let name = self
+                            .collections
+                            .playlists
+                            .iter()
+                            .find(|p| p.id == id)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("playlist");
+                        (PlaylistExportTarget::Custom(id), name)
+                    }
+                    PlaylistView::Smart(id) => {
+                        let name = self
+                            .collections
+                            .smart
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("smart_playlist");
+                        (PlaylistExportTarget::Smart(id), name)
+                    }
+                };
+                let suggested = suggest_export_filename(raw_name, "m3u8");
+                Task::perform(pick_playlist_export_file(suggested, false), move |res| {
+                    Message::PlaylistM3u8ExportPicked(target, res)
+                })
+            }
+            Message::PlaylistM3u8ExportPicked(target, Ok(Some(dest))) => {
+                let _ = self
+                    .cmd_tx
+                    .send(ControllerCommand::ExportPlaylistM3u8 { target, dest });
+                Task::none()
+            }
+            Message::PlaylistM3u8ExportPicked(_, Ok(None)) => Task::none(),
+            Message::PlaylistM3u8ExportPicked(_, Err(err)) => {
+                self.toasts.push(NoticeKind::Error, err)
+            }
+            Message::ContextExportPlaylistZip(id) => {
+                self.context_menu = None;
+                let raw_name = self
+                    .collections
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("playlist");
+                let suggested = suggest_export_filename(raw_name, "zip");
+                Task::perform(pick_playlist_export_file(suggested, true), move |res| {
+                    Message::PlaylistZipExportPicked(id, res)
+                })
+            }
+            Message::PlaylistZipExportPicked(id, Ok(Some(dest))) => {
+                let _ = self.cmd_tx.send(ControllerCommand::ExportPlaylistZip {
+                    playlist_id: id,
+                    dest,
+                });
+                Task::none()
+            }
+            Message::PlaylistZipExportPicked(_, Ok(None)) => Task::none(),
+            Message::PlaylistZipExportPicked(_, Err(err)) => {
+                self.toasts.push(NoticeKind::Error, err)
             }
             Message::OpenDetailMenu(ctx, pos) => {
                 self.context_menu = Some(context_menu::ContextMenu {
@@ -3510,16 +3705,11 @@ impl App {
                 let _ = self.cmd_tx.send(ControllerCommand::PruneMissing { roots });
                 Task::none()
             }
-            dialogs::ConfirmAction::DeletePlaylist { id, cover_art } => {
+            dialogs::ConfirmAction::DeletePlaylist(id) => {
                 self.leave_deleted_page(PlaylistView::Custom(id));
                 let _ = self.cmd_tx.send(ControllerCommand::DeletePlaylist(id));
-                let toast = self.toasts.push(NoticeKind::Info, format!("PLAYLIST_DELETED // {}", d.target));
-                // The playlist's own cover files go too (files named native_pl_*, nothing else is touched)
-                let covers = Task::future(tokio::task::spawn_blocking(move || {
-                    rustygrade_core::covers::PlaylistCovers::delete(cover_art.as_deref())
-                }))
-                .discard();
-                Task::batch([toast, covers])
+                self.toasts
+                    .push(NoticeKind::Info, format!("PLAYLIST_DELETED // {}", d.target))
             }
             dialogs::ConfirmAction::DeleteSmartPlaylist(id) => {
                 self.leave_deleted_page(PlaylistView::Smart(id));
@@ -3543,6 +3733,13 @@ impl App {
                 self.selected_albums.clear();
                 self.deleting_albums = true;
                 let _ = self.cmd_tx.send(ControllerCommand::DeleteAlbums(names));
+                Task::none()
+            }
+            dialogs::ConfirmAction::ReplaceCollectionsZip(path) => {
+                let _ = self.cmd_tx.send(ControllerCommand::ImportCollectionsZip {
+                    path,
+                    replace: true,
+                });
                 Task::none()
             }
         }
@@ -3625,6 +3822,14 @@ impl App {
         self.covers.sync_collections(&self.collections);
         self.artists = group_artists(&albums);
         self.albums = albums;
+        self.page_stack.retain(|p| match p {
+            pages::Page::Album(k) => self
+                .albums
+                .iter()
+                .any(|a| a.name == k.name && a.artist == k.artist),
+            pages::Page::Artist(k) => self.artists.iter().any(|a| artist_key(&a.name) == *k),
+            pages::Page::Playlist(_) => true,
+        });
         self.rebuild_track_map();
         self.rebuild_library_view();
         self.rebuild_search();
@@ -3632,11 +3837,11 @@ impl App {
         self.rebuild_smart_cache();
         self.recompute_smart_draft_count();
         if let Some(t) = &self.current_track {
-            if let Some(p) = t.cover_full_path.as_deref() {
-                self.covers.ensure_full(p);
-            }
             if let Some(p) = t.cover_thumb_path.as_deref() {
                 self.covers.ensure_thumb(p);
+            }
+            if let Some(p) = t.cover_full_path.as_deref() {
+                self.covers.ensure_full(p);
             }
         }
     }
@@ -3644,6 +3849,38 @@ impl App {
     fn apply_collections(&mut self, col: CollectionsData) {
         self.covers.sync_collections(&col);
         self.collections = col;
+        self.page_stack.retain(|p| match p {
+            pages::Page::Playlist(PlaylistView::Custom(id)) => {
+                self.collections.playlists.iter().any(|pl| pl.id == *id)
+            }
+            pages::Page::Playlist(PlaylistView::Smart(id)) => self
+                .collections
+                .smart
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|sp| sp.id == *id),
+            _ => true,
+        });
+        match self.playlist_view {
+            PlaylistView::Custom(id)
+                if !self.collections.playlists.iter().any(|pl| pl.id == id) =>
+            {
+                self.leave_deleted_page(PlaylistView::Custom(id));
+            }
+            PlaylistView::Smart(id)
+                if !self
+                    .collections
+                    .smart
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|sp| sp.id == id) =>
+            {
+                self.leave_deleted_page(PlaylistView::Smart(id));
+            }
+            _ => {}
+        }
         self.rebuild_search();
         self.rebuild_liked_set();
         self.rebuild_smart_counts();
@@ -3734,19 +3971,30 @@ impl App {
             ControllerEvent::TrackChanged(track) => {
                 let prev_id = self.current_track.as_ref().map(|t| t.id.as_str());
                 let next_id = track.as_ref().map(|t| t.id.as_str());
+                let same_track = prev_id.is_some() && prev_id == next_id;
+                let cover_changed = same_track
+                    && self.current_track.as_ref().zip(track.as_ref()).is_some_and(|(a, b)| {
+                        a.cover_thumb_path != b.cover_thumb_path
+                            || a.cover_full_path != b.cover_full_path
+                    });
                 if prev_id != next_id {
                     self.lyrics = None;
                     self.seeking_pos = None;
                 }
                 if let Some(t) = &track {
-                    if let Some(p) = t.cover_full_path.as_deref() {
-                        self.covers.ensure_full(p);
-                    }
                     if let Some(p) = t.cover_thumb_path.as_deref() {
                         self.covers.ensure_thumb(p);
                     }
+                    if let Some(p) = t.cover_full_path.as_deref() {
+                        self.covers.ensure_full(p);
+                    }
                 }
                 self.current_track = track;
+                if cover_changed {
+                    self.fs_blur_tried = None;
+                    self.fs_blur = None;
+                    return self.fs_refresh_backdrop();
+                }
             }
             ControllerEvent::AccentPaletteChanged(palette) => {
                 let (pal, from_cover) = match palette {
@@ -4237,6 +4485,26 @@ impl PresentWatchdog {
     }
 }
 
+fn format_zip_replace_detail(summary: &ZipArchiveSummary) -> String {
+    let mut base = if !summary.has_collections && summary.has_stats {
+        format!("ARCHIVE: {} PLAY STAT(S) ONLY", summary.stats_tracks)
+    } else {
+        let mut parts = vec![
+            format!("{} PLAYLIST(S)", summary.playlists),
+            format!("{} FAVORITE(S)", summary.liked),
+            format!("{} SMART", summary.smart),
+        ];
+        if summary.has_stats {
+            parts.push(format!("{} PLAY STAT(S)", summary.stats_tracks));
+        }
+        format!("ARCHIVE: {}", parts.join(", "))
+    };
+    if summary.has_settings {
+        base.push_str(" (SETTINGS SKIPPED)");
+    }
+    base
+}
+
 fn animations_active(setting_enabled: bool, tier: RenderTier) -> bool {
     setting_enabled && tier.enable_animations
 }
@@ -4268,8 +4536,42 @@ fn resolve_playback_tick_mode(
 mod tests {
     use super::{
         Duration, Instant, PerformanceMode, PlaybackTickMode, PowerProfile, PresentWatchdog,
-        RenderTier, WatchdogAction, animations_active, format_mm_ss, resolve_playback_tick_mode,
+        RenderTier, WatchdogAction, ZipArchiveSummary, animations_active, format_mm_ss,
+        format_zip_replace_detail, resolve_playback_tick_mode,
     };
+
+    #[test]
+    fn format_zip_replace_detail_summarizes_archive_contents() {
+        let full = ZipArchiveSummary {
+            playlists: 3,
+            liked: 12,
+            smart: 2,
+            stats_tracks: 40,
+            has_collections: true,
+            has_stats: true,
+            has_settings: true,
+            is_single_playlist_export: false,
+        };
+        assert_eq!(
+            format_zip_replace_detail(&full),
+            "ARCHIVE: 3 PLAYLIST(S), 12 FAVORITE(S), 2 SMART, 40 PLAY STAT(S) (SETTINGS SKIPPED)"
+        );
+
+        let stats_only = ZipArchiveSummary {
+            playlists: 0,
+            liked: 0,
+            smart: 0,
+            stats_tracks: 7,
+            has_collections: false,
+            has_stats: true,
+            has_settings: false,
+            is_single_playlist_export: false,
+        };
+        assert_eq!(
+            format_zip_replace_detail(&stats_only),
+            "ARCHIVE: 7 PLAY STAT(S) ONLY"
+        );
+    }
 
     #[test]
     fn animations_active_tracks_power_profile_and_manual_setting() {

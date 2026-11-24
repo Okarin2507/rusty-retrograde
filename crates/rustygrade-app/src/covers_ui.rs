@@ -82,13 +82,23 @@ impl CoverCache {
     }
 
     pub fn ensure_thumb(&mut self, path: &Path) {
-        if !self.thumbs.contains_key(path) {
-            self.thumbs
-                .insert(path.to_path_buf(), load_handle(path));
+        if self.thumbs.contains_key(path) {
+            return;
         }
+        // Content-addressed covers reuse a single file for both thumb and full views;
+        // promote an already-loaded full handle instead of decoding the image twice.
+        if let Some(handle) = self.fulls.remove(path) {
+            self.full_lru.retain(|p| p != path);
+            self.thumbs.insert(path.to_path_buf(), handle);
+            return;
+        }
+        self.thumbs.insert(path.to_path_buf(), load_handle(path));
     }
 
     pub fn ensure_full(&mut self, path: &Path) {
+        if self.thumbs.contains_key(path) {
+            return;
+        }
         if self.fulls.contains_key(path) {
             self.touch_full(path);
             return;
@@ -239,5 +249,31 @@ mod tests {
         assert!(cache.get_first(&[Some(paths[0].as_path())]).is_some());
         assert!(cache.get_first(&[Some(paths[1].as_path())]).is_none());
         assert!(cache.get_first(&[Some(paths[8].as_path())]).is_some());
+    }
+
+    #[test]
+    fn ensure_full_skips_path_already_cached_as_thumb() {
+        let mut cache = CoverCache::default();
+        let shared = PathBuf::from("/tmp/c_shared.jpg");
+        cache.ensure_thumb(&shared);
+        cache.ensure_full(&shared);
+        assert!(cache.thumbs.contains_key(&shared));
+        assert!(!cache.fulls.contains_key(&shared));
+        assert!(cache.get_first(&[Some(shared.as_path())]).is_some());
+    }
+
+    #[test]
+    fn ensure_thumb_promotes_existing_full_handle_without_duplicating() {
+        let mut cache = CoverCache::default();
+        let shared = PathBuf::from("/tmp/c_shared_promote.jpg");
+        cache.ensure_full(&shared);
+        assert!(cache.fulls.contains_key(&shared));
+        assert_eq!(cache.full_lru.len(), 1);
+
+        cache.ensure_thumb(&shared);
+        assert!(cache.thumbs.contains_key(&shared));
+        assert!(!cache.fulls.contains_key(&shared));
+        assert!(cache.full_lru.is_empty());
+        assert!(cache.get_first(&[Some(shared.as_path())]).is_some());
     }
 }

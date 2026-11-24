@@ -583,6 +583,14 @@ impl PlaybackQueue {
         self.hand = 0;
     }
 
+    pub fn all_track_ids(&self) -> HashSet<String> {
+        let mut ids: HashSet<String> = self.tracks.iter().map(|t| t.id.clone()).collect();
+        if let Some(back) = &self.unshuffled {
+            ids.extend(back.iter().map(|t| t.id.clone()));
+        }
+        ids
+    }
+
     /// Drops all tracks whose id is in `ids`, keeping `index` and `hand` consistent when the current
     /// track survives, or clearing playback state (`current_was_removed = true`) like C# `RemoveTracksAsync`.
     /// Returns `(queue_changed, current_was_removed)`.
@@ -1358,5 +1366,36 @@ mod tests {
         assert!(changed2);
         assert!(cur_removed2);
         assert_eq!(q.index(), None);
+    }
+
+    #[test]
+    fn all_track_ids_includes_shuffled_and_unshuffled_queues() {
+        let t1 = mk_track("t1", "A", 100.0);
+        let t2 = mk_track("t2", "A", 100.0);
+        let t3 = mk_track("t3", "A", 100.0);
+        let alb = mk_album("A", &["t1", "t2", "t3"]);
+        let mut index = HashMap::new();
+        for t in [&t1, &t2, &t3] {
+            index.insert(t.id.clone(), (t.clone(), alb.clone()));
+        }
+        let state = SessionState {
+            current_id: Some("t1".to_owned()),
+            index: 0,
+            position: 0.0,
+            shuffle: true,
+            repeat_mode: 0,
+        };
+        let mut q = PlaybackQueue::default();
+        q.restore_session(
+            &index,
+            &state,
+            &["t1".to_owned(), "t3".to_owned()],
+            Some(&["t1".to_owned(), "t2".to_owned(), "t3".to_owned()]),
+        );
+        let all = q.all_track_ids();
+        assert_eq!(all.len(), 3);
+        assert!(all.contains("t1"));
+        assert!(all.contains("t2"));
+        assert!(all.contains("t3"));
     }
 }

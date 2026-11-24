@@ -201,8 +201,12 @@ impl App {
                         let (w, h) = img.dimensions();
                         image::Handle::from_rgba(w, h, img.into_raw())
                     };
-                    let thumb_img = thumb.as_deref().and_then(|p| ::image::open(p).ok());
-                    let full_img = full.as_deref().and_then(|p| ::image::open(p).ok());
+                    let separate_thumb = thumb.as_deref().filter(|t| full.as_deref() != Some(*t));
+                    let full_img = full
+                        .as_deref()
+                        .or(thumb.as_deref())
+                        .and_then(|p| ::image::open(p).ok());
+                    let thumb_img = separate_thumb.and_then(|p| ::image::open(p).ok());
                     let blur = thumb_img.as_ref().or(full_img.as_ref()).map(|img| {
                         let small = img.resize_exact(48, 48, ::image::imageops::FilterType::Triangle).to_rgba8();
                         let blurred = ::image::imageops::blur(&small, 3.0);

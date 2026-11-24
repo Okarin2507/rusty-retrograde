@@ -20,6 +20,8 @@ rustygrade-linux = { path = "crates/rustygrade-linux", default-features = false 
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.5"
 ureq = { version = "3.5", default-features = false, features = ["rustls", "gzip"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros", "fs"] }
 thiserror = "2.0"

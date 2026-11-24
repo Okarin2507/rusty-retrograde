@@ -8,27 +8,49 @@ pub struct CoverPaths;
 /// Does nothing when the new folder already exists or the old one is absent.
 fn migrate_legacy_dir(home: &Path, dir: &Path) {
     let legacy = home.join(".retrograde");
-    if !dir.exists() && legacy.is_dir() {
-        if std::fs::rename(&legacy, dir).is_ok() {
-            // Cover URLs in the library are absolute `file://` paths into the old folder.
-            for name in ["library.json", "library.json.bak", "native-collections.json", "native-collections.json.bak"] {
-                let path = dir.join(name);
-                if let Ok(text) = std::fs::read_to_string(&path)
-                    && text.contains("/.retrograde/")
-                {
-                    let tmp = path.with_extension("tmp");
-                    if std::fs::write(&tmp, text.replace("/.retrograde/", "/.rustygrade/")).is_ok() {
-                        let _ = std::fs::rename(&tmp, &path);
-                    }
+    if !dir.exists() && legacy.is_dir() && std::fs::rename(&legacy, dir).is_ok() {
+        // Cover URLs in the library are absolute `file://` paths into the old folder.
+        for name in ["library.json", "library.json.bak", "native-collections.json", "native-collections.json.bak"] {
+            let path = dir.join(name);
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && text.contains("/.retrograde/")
+            {
+                let tmp = path.with_extension("tmp");
+                if std::fs::write(&tmp, text.replace("/.retrograde/", "/.rustygrade/")).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
                 }
             }
         }
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_APP_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_app_dir<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_APP_DIR.with(|cell| {
+                *cell.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let prev = TEST_APP_DIR.with(|cell| cell.borrow_mut().replace(dir.to_path_buf()));
+    let _guard = Reset(prev);
+    f()
+}
+
 impl CoverPaths {
     /// `~/.rustygrade`, or `RETRO_APPDIR` when set and non-empty (tests run against a scratch copy).
     pub fn app_dir() -> PathBuf {
+        #[cfg(test)]
+        if let Some(dir) = TEST_APP_DIR.with(|cell| cell.borrow().clone()) {
+            return dir;
+        }
         if let Ok(dir) = std::env::var("RETRO_APPDIR")
             && !dir.is_empty()
         {
@@ -71,13 +93,52 @@ impl CoverPaths {
         Self::cover_dir().join(format!("{}_full.jpg", Self::hash_name(album_name)))
     }
 
+    pub fn content_cover_path(hash_hex: &str, ext: &str) -> PathBuf {
+        Self::cover_dir().join(format!("c_{hash_hex}.{ext}"))
+    }
+
+    pub fn is_content_cover_file(path: &Path) -> bool {
+        if path.parent() != Some(Self::cover_dir().as_path()) {
+            return false;
+        }
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                name.starts_with("c_")
+                    && !name.contains(".tmp.")
+                    && !name.ends_with(".resync-old")
+                    && !name.ends_with(".shrink-tmp")
+            })
+    }
+
+    pub fn is_managed_cover_file(path: &Path) -> bool {
+        if path.parent() != Some(Self::cover_dir().as_path()) {
+            return false;
+        }
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                if name.contains(".tmp")
+                    || name.ends_with(".resync-old")
+                    || name.ends_with(".shrink-tmp")
+                {
+                    return false;
+                }
+                let lower = name.to_ascii_lowercase();
+                name.starts_with("c_")
+                    || name.starts_with("native_pl_")
+                    || lower.ends_with("_thumb.jpg")
+                    || lower.ends_with("_full.jpg")
+            })
+    }
+
     /// Turns `"file:///path/to/x.jpg?t=..."` or a plain path into a local `PathBuf`.
     pub fn to_local_path(url_or_path: Option<&str>) -> Option<PathBuf> {
         let raw = url_or_path?.trim();
         if raw.is_empty() {
             return None;
         }
-        if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("file://") {
+        if raw.as_bytes().get(..7).is_some_and(|b| b.eq_ignore_ascii_case(b"file://")) {
             let stripped = match raw.find('?') {
                 Some(idx) => &raw[..idx],
                 None => raw,

@@ -32,7 +32,10 @@ pub enum ContextMenuKind {
         removable_playlist: Option<i64>,
     },
     Album(AlbumKey),
-    Playlist(i64),
+    Playlist {
+        view: PlaylistView,
+        tracks: Vec<Track>,
+    },
     PlaylistPicker {
         tracks: Vec<Track>,
     },
@@ -391,66 +394,155 @@ pub fn view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
             push_playlist_entries(&mut entries, app, &tracks, true);
             ("ALBUM_OPERATIONS", theme::ORANGE)
         }
-        ContextMenuKind::Playlist(id) => {
-            let tracks = app.detail_tracks(&DetailCtx::Playlist(PlaylistView::Custom(*id)));
-            let track_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
-            let all_liked = !track_ids.is_empty() && track_ids.iter().all(|id| app.liked_set.contains(id));
-            let has_cover = app
-                .collections
-                .playlists
-                .iter()
-                .find(|p| p.id == *id)
-                .is_some_and(|p| p.cover_art.is_some());
-            entries.push(action(
-                "playnext",
-                dim,
-                "PLAY_NEXT",
-                false,
-                Message::ContextPlayNext(tracks.clone()),
-            ));
-            entries.push(action(
-                "listmusic",
-                dim,
-                "ADD_ALL_TO_QUEUE",
-                false,
-                Message::ContextEnqueue(tracks.clone()),
-            ));
-            entries.push(action(
-                "heart",
-                if all_liked { theme::ORANGE } else { dim },
-                if all_liked {
-                    "UNLIKE_ALL_TRACKS"
-                } else {
-                    "LIKE_ALL_TRACKS"
-                },
-                false,
-                Message::ContextToggleLikeTracks(track_ids),
-            ));
-            entries.push(action(
-                "upload",
-                dim,
-                "CHANGE_COVER",
-                false,
-                Message::PickPlaylistCover(*id),
-            ));
-            if has_cover {
+        ContextMenuKind::Playlist { view, tracks } => match view {
+            PlaylistView::Custom(id) => {
+                let track_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                let all_liked =
+                    !track_ids.is_empty() && track_ids.iter().all(|id| app.liked_set.contains(id));
+                let has_cover = app
+                    .collections
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .is_some_and(|p| p.cover_art.is_some());
+                entries.push(action(
+                    "playnext",
+                    dim,
+                    "PLAY_NEXT",
+                    false,
+                    Message::ContextPlayNext(tracks.clone()),
+                ));
+                entries.push(action(
+                    "listmusic",
+                    dim,
+                    "ADD_ALL_TO_QUEUE",
+                    false,
+                    Message::ContextEnqueue(tracks.clone()),
+                ));
+                entries.push(action(
+                    "heart",
+                    if all_liked { theme::ORANGE } else { dim },
+                    if all_liked {
+                        "UNLIKE_ALL_TRACKS"
+                    } else {
+                        "LIKE_ALL_TRACKS"
+                    },
+                    false,
+                    Message::ContextToggleLikeTracks(track_ids),
+                ));
+                entries.push(action(
+                    "upload",
+                    dim,
+                    "CHANGE_COVER",
+                    false,
+                    Message::PickPlaylistCover(*id),
+                ));
+                if has_cover {
+                    entries.push(action(
+                        "trash",
+                        theme::ORANGE,
+                        "REMOVE_COVER",
+                        true,
+                        Message::ContextRemovePlaylistCover(*id),
+                    ));
+                }
+                entries.push(action(
+                    "download",
+                    dim,
+                    "EXPORT_M3U8",
+                    false,
+                    Message::ContextExportPlaylistM3u8(PlaylistView::Custom(*id)),
+                ));
+                entries.push(action(
+                    "download",
+                    dim,
+                    "EXPORT_ZIP",
+                    false,
+                    Message::ContextExportPlaylistZip(*id),
+                ));
                 entries.push(action(
                     "trash",
                     theme::ORANGE,
-                    "REMOVE_COVER",
+                    "DELETE_PLAYLIST",
                     true,
-                    Message::ContextRemovePlaylistCover(*id),
+                    Message::ContextDeletePlaylist(*id),
                 ));
+                push_playlist_entries(&mut entries, app, tracks, true);
+                ("PLAYLIST_OPERATIONS", theme::ORANGE)
             }
-            entries.push(action(
-                "trash",
-                theme::ORANGE,
-                "DELETE_PLAYLIST",
-                true,
-                Message::ContextDeletePlaylist(*id),
-            ));
-            push_playlist_entries(&mut entries, app, &tracks, true);
-            ("ALBUM_OPERATIONS", theme::ORANGE)
+            PlaylistView::Liked => {
+                entries.push(action(
+                    "playnext",
+                    dim,
+                    "PLAY_NEXT",
+                    false,
+                    Message::ContextPlayNext(tracks.clone()),
+                ));
+                entries.push(action(
+                    "listmusic",
+                    dim,
+                    "ADD_ALL_TO_QUEUE",
+                    false,
+                    Message::ContextEnqueue(tracks.clone()),
+                ));
+                entries.push(action(
+                    "download",
+                    dim,
+                    "EXPORT_M3U8",
+                    false,
+                    Message::ContextExportPlaylistM3u8(PlaylistView::Liked),
+                ));
+                push_playlist_entries(&mut entries, app, tracks, true);
+                ("FAVORITES_OPERATIONS", theme::GOLD)
+            }
+            PlaylistView::Smart(id) => {
+                entries.push(action(
+                    "playnext",
+                    dim,
+                    "PLAY_NEXT",
+                    false,
+                    Message::ContextPlayNext(tracks.clone()),
+                ));
+                entries.push(action(
+                    "listmusic",
+                    dim,
+                    "ADD_ALL_TO_QUEUE",
+                    false,
+                    Message::ContextEnqueue(tracks.clone()),
+                ));
+                if let Some(sp) = app
+                    .collections
+                    .smart
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|s| s.id == *id)
+                {
+                    entries.push(action(
+                        "filter",
+                        theme::TEAL,
+                        "EDIT_RULES",
+                        false,
+                        Message::ContextEditSmart(sp.clone()),
+                    ));
+                    entries.push(action(
+                        "download",
+                        dim,
+                        "EXPORT_M3U8",
+                        false,
+                        Message::ContextExportPlaylistM3u8(PlaylistView::Smart(*id)),
+                    ));
+                    entries.push(action(
+                        "trash",
+                        theme::ORANGE,
+                        "DELETE_SMART_PLAYLIST",
+                        true,
+                        Message::ContextDeleteSmart(*id),
+                    ));
+                }
+                push_playlist_entries(&mut entries, app, tracks, true);
+                ("SMART_OPERATIONS", theme::TEAL)
+            }
         }
         ContextMenuKind::PlaylistPicker { tracks } => {
             push_playlist_entries(&mut entries, app, tracks, false);
@@ -516,6 +608,20 @@ pub fn view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
                     ));
                 }
                 entries.push(action(
+                    "download",
+                    dim,
+                    "EXPORT_M3U8",
+                    false,
+                    Message::ContextExportPlaylistM3u8(PlaylistView::Custom(*id)),
+                ));
+                entries.push(action(
+                    "download",
+                    dim,
+                    "EXPORT_ZIP",
+                    false,
+                    Message::ContextExportPlaylistZip(*id),
+                ));
+                entries.push(action(
                     "trash",
                     theme::ORANGE,
                     "DELETE_PLAYLIST",
@@ -541,6 +647,13 @@ pub fn view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
                         Message::ContextEditSmart(sp.clone()),
                     ));
                     entries.push(action(
+                        "download",
+                        dim,
+                        "EXPORT_M3U8",
+                        false,
+                        Message::ContextExportPlaylistM3u8(PlaylistView::Smart(*id)),
+                    ));
+                    entries.push(action(
                         "trash",
                         theme::ORANGE,
                         "DELETE_SMART_PLAYLIST",
@@ -549,6 +662,16 @@ pub fn view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
                     ));
                 }
                 ("SMART_OPERATIONS", theme::TEAL)
+            }
+            DetailCtx::Playlist(PlaylistView::Liked) => {
+                entries.push(action(
+                    "download",
+                    dim,
+                    "EXPORT_M3U8",
+                    false,
+                    Message::ContextExportPlaylistM3u8(PlaylistView::Liked),
+                ));
+                ("FAVORITES_OPERATIONS", theme::GOLD)
             }
             _ => ("OPERATIONS", theme::TEAL),
         },

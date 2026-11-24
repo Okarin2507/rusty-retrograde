@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::pending;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustygrade_audio::{
     AO_INIT_FAILED, AlsaDirect, AlsaHwParams, AlsaMixer, AudioDevice, AudioPath, BRIDGE_NODE_NAME,
@@ -12,12 +12,17 @@ use rustygrade_audio::{
     PipeWireBridge, evaluate_bit_perfect,
 };
 use rustygrade_core::library::build_track_index;
-use rustygrade_core::scanner::ScanOptions;
+use rustygrade_core::scanner::{PrunePolicy, ScanOptions};
 use rustygrade_core::{
     Album, AppSettings, CollectionsData, CollectionsStore, CoverPalette, CoverPaths,
-    DirectVolumeBridge, FolderWatcher, LibraryStore, LyricsDoc, LyricsLoader, PlayStats,
-    PlaylistCovers, ScanResult, Scanner, SessionState, SessionStore, SmartPlaylistData, TagEdit,
-    TagWriter, Track, extract_cover_palette,
+    DirectVolumeBridge, FolderWatcher, IngestedZipImport, LibraryStore, LyricsDoc, LyricsLoader,
+    M3uImportResult, PlayStats, PlaylistCovers, PlaylistData, PlaylistIoError, ScanResult,
+    Scanner, SessionState, SessionStore, SmartPlaylistData, SmartPlaylists, TagEdit, TagWriter,
+    Track, ZipImportReport, claim_next_id, collect_playlist_cover_paths,
+    deduplicate_and_sweep_covers, delete_unreferenced_covers_with_extra,
+    export_collections_zip_file, export_m3u8_file, export_playlist_zip_file, extract_cover_palette,
+    import_m3u_file, migrate_playlist_covers, nearest_watched_ancestor, prepare_zip_import,
+    read_backup_zip,
 };
 use rustygrade_linux::{
     ArtworkProviders, DeviceReservation, DiscordPlaybackStatus, DiscordPresence, DiscordRpcService,
@@ -76,6 +81,13 @@ pub enum PlaybackTickMode {
     /// Hidden to tray, minimized, or compositor-suspended (no frames presented while unfocused):
     /// suppress periodic position ticks completely until resumed.
     Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistExportTarget {
+    Liked,
+    Custom(i64),
+    Smart(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +160,24 @@ pub enum ControllerCommand {
     RemovePlaylistCover(i64),
     SaveSmartPlaylist(SmartPlaylistData),
     DeleteSmartPlaylist(i64),
+    ExportPlaylistM3u8 {
+        target: PlaylistExportTarget,
+        dest: PathBuf,
+    },
+    ExportPlaylistZip {
+        playlist_id: i64,
+        dest: PathBuf,
+    },
+    ExportCollectionsZip {
+        dest: PathBuf,
+    },
+    ImportPlaylistM3u {
+        path: PathBuf,
+    },
+    ImportCollectionsZip {
+        path: PathBuf,
+        replace: bool,
+    },
     DeleteAlbums(Vec<String>),
     ScanFolders(Vec<PathBuf>),
     ScanFiles(Vec<PathBuf>),
@@ -365,6 +395,14 @@ struct TagBatchResult {
     old_covers: Vec<PathBuf>,
 }
 
+enum PlaylistIoDone {
+    M3u(Result<M3uImportResult, PlaylistIoError>),
+    Zip {
+        replace: bool,
+        result: Result<IngestedZipImport, (PlaylistIoError, Vec<PathBuf>)>,
+    },
+}
+
 struct Coordinator {
     settings: AppSettings,
     mpv: MpvEngine,
@@ -399,6 +437,7 @@ struct Coordinator {
     watcher: Option<FolderWatcher>,
     watch_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>,
     pending_watch_paths: Vec<PathBuf>,
+    pending_startup_sync: bool,
     pending_full_rescan: bool,
     /// RESYNC COVERS asked for while a scan ran; started once it ends.
     pending_cover_resync: bool,
@@ -411,16 +450,21 @@ struct Coordinator {
     /// Audio files from an "Open with" request, played once a scan has indexed them.
     pending_open_play: Vec<PathBuf>,
     scan_cancel: Option<Arc<AtomicBool>>,
-    scan_done_rx: Option<mpsc::UnboundedReceiver<Result<ScanResult, String>>>,
+    scan_done_rx: Option<mpsc::UnboundedReceiver<Result<ScanOutcome, String>>>,
     lyrics_done_rx: Option<mpsc::UnboundedReceiver<(String, Option<LyricsDoc>)>>,
     accent_done_rx: Option<mpsc::UnboundedReceiver<(String, Option<CoverPalette>)>>,
     tag_done_tx: mpsc::UnboundedSender<TagBatchResult>,
     tag_done_rx: Option<mpsc::UnboundedReceiver<TagBatchResult>>,
+    playlist_io_done_tx: mpsc::UnboundedSender<PlaylistIoDone>,
+    playlist_io_done_rx: Option<mpsc::UnboundedReceiver<PlaylistIoDone>>,
+    playlist_import_in_flight: bool,
     persist_tx: mpsc::UnboundedSender<PersistMsg>,
     power_profile: PowerProfile,
     render_tier: RenderTier,
     albums: std::sync::Arc<[Album]>,
     collections: CollectionsData,
+    live_playlist_covers: Arc<Mutex<HashSet<PathBuf>>>,
+    pending_import_covers: Arc<Mutex<HashSet<PathBuf>>>,
     stats: PlayStats,
     queue: PlaybackQueue,
     play_tracker: PlayTracker,
@@ -462,12 +506,20 @@ fn resolve_open_uri(raw: &str) -> Option<PathBuf> {
 /// means it is not about one file (unplugged drive, busy device), so playback stops there.
 const MAX_FAILED_SKIPS: u32 = 5;
 
+struct ScanOutcome {
+    result: ScanResult,
+    covers_migrated: bool,
+    changed_paths: Vec<PathBuf>,
+}
+
 /// Who started a scan, which decides what the user hears about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanKind {
+    /// App startup: reconciles deletions/additions made offline and deduplicates covers.
+    Startup,
     /// F5, tray, ADD MUSIC, drag and drop: progress card, result toast, missing-files prompt.
     Manual,
-    /// Folder watcher / tag save: quiet, a toast only when something changed. Never prunes.
+    /// Folder watcher: quiet, a toast only when something changed. Safely prunes online deletions.
     Watch,
     /// Settings → RESYNC COVERS: forgets every album cover, then a manual-style scan of the library
     /// roots extracts them again from the files. Never prunes.
@@ -478,7 +530,7 @@ enum ScanKind {
 struct ScanJob {
     kind: ScanKind,
     roots: Vec<PathBuf>,
-    prune: bool,
+    prune: PrunePolicy,
 }
 
 /// C# `LibraryRoots()`: the added folders and the folder of every track, a folder inside another
@@ -513,13 +565,59 @@ fn library_roots(folders: &[String], albums: &[Album]) -> Vec<PathBuf> {
     roots
 }
 
-/// Every album thumbnail and full cover path, for invalidating the UI's image cache.
+/// Every unique album thumbnail and full cover path, for invalidating the UI's image cache.
 fn album_cover_paths(albums: &[Album]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
     albums
         .iter()
         .flat_map(|a| [a.cover_thumb_path.clone(), a.cover_full_path.clone()])
         .flatten()
+        .filter(|p| seen.insert(p.clone()))
         .collect()
+}
+
+/// Drops queued tracks missing from `index` and refreshes metadata on all surviving tracks.
+/// Returns `(queue_changed, current_track_removed)`.
+fn reconcile_queue_with_library(
+    queue: &mut PlaybackQueue,
+    index: &HashMap<String, (Track, Album)>,
+) -> (bool, bool) {
+    if queue.is_empty() {
+        return (false, false);
+    }
+    let missing_ids: HashSet<String> = queue
+        .all_track_ids()
+        .into_iter()
+        .filter(|id| !index.contains_key(id))
+        .collect();
+    let (q_changed, cur_removed) = if missing_ids.is_empty() {
+        (false, false)
+    } else {
+        queue.remove_tracks_by_id(&missing_ids)
+    };
+    if !queue.is_empty() {
+        queue.refresh_from_library(index);
+    }
+    (q_changed, cur_removed)
+}
+
+/// Resolves the nearest existing parent directory inside `library_folders` to rescan when a
+/// track fails with a missing file. Returns `None` for loose files outside library folders or
+/// when the root itself is unavailable.
+fn failed_track_rescan_target(file_path: &Path, library_folders: &[String]) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::with_capacity(library_folders.len() * 2);
+    for folder in library_folders {
+        let p = PathBuf::from(folder);
+        if let Ok(canon) = std::fs::canonicalize(&p)
+            && !roots.contains(&canon)
+        {
+            roots.push(canon);
+        }
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
+    nearest_watched_ancestor(file_path, &roots)
 }
 
 /// The C# scan toast parts: "3 NEW, 1 UPDATED, ...".
@@ -533,6 +631,8 @@ fn scan_summary(r: &ScanResult) -> String {
     }
     if r.removed_tracks > 0 {
         parts.push(format!("{} REMOVED", r.removed_tracks));
+    } else if r.removed_albums > 0 {
+        parts.push(format!("{} EMPTY ALBUMS REMOVED", r.removed_albums));
     }
     if r.covers > 0 {
         parts.push(format!("{} COVERS", r.covers));
@@ -710,27 +810,14 @@ pub async fn run_coordinator(
         }
         loaded.map_err(|e| e.to_string())
     });
-    // Full covers stored before import was capped (or by the C# build) are shrunk in the
-    // background; the UI reloads any it has already cached.
-    let shrink_ui_tx = ui_tx.clone();
-    tokio::spawn(async move {
-        let changed = tokio::task::spawn_blocking(|| {
-            rustygrade_core::covers::shrink_oversized_full_covers(
-                &CoverPaths::cover_dir(),
-                rustygrade_core::covers::MAX_FULL_COVER_EDGE,
-            )
-        })
-        .await
-        .unwrap_or_default();
-        if !changed.is_empty() {
-            info!(count = changed.len(), "Shrank oversized full covers");
-            let _ = shrink_ui_tx.send(ControllerEvent::CoversInvalidated(changed));
-        }
-    });
     let saved_state_task = tokio::task::spawn_blocking(|| {
+        // First run (or an unreadable file): seed liked songs and playlists from the old Electron app, as C# does.
+        let mut collections = CollectionsStore::load_or_import();
+        if migrate_playlist_covers(&mut collections) {
+            CollectionsStore::save(&collections);
+        }
         (
-            // First run (or an unreadable file): seed liked songs and playlists from the old Electron app, as C# does.
-            CollectionsStore::load_or_import(),
+            collections,
             PlayStats::load(),
             SessionStore::load(),
             SessionStore::load_original_queue(),
@@ -806,6 +893,7 @@ pub async fn run_coordinator(
 
     let persist_tx = spawn_persist_worker();
     let (tag_done_tx, tag_done_rx) = mpsc::unbounded_channel();
+    let (playlist_io_done_tx, playlist_io_done_rx) = mpsc::unbounded_channel();
     let initial_vol = startup.settings.volume.clamp(0.0, 1.0);
     let eq_filters = EqualizerConfig::build_filters(
         startup.settings.eq_enabled,
@@ -849,6 +937,7 @@ pub async fn run_coordinator(
         watcher: None,
         watch_rx: None,
         pending_watch_paths: Vec::new(),
+        pending_startup_sync: false,
         pending_full_rescan: false,
         pending_cover_resync: false,
         pending_prune: None,
@@ -861,11 +950,16 @@ pub async fn run_coordinator(
         accent_done_rx: None,
         tag_done_tx,
         tag_done_rx: Some(tag_done_rx),
+        playlist_io_done_tx,
+        playlist_io_done_rx: Some(playlist_io_done_rx),
+        playlist_import_in_flight: false,
         persist_tx,
         power_profile,
         render_tier,
         albums: std::sync::Arc::from(Vec::new()),
         collections: CollectionsData::default(),
+        live_playlist_covers: Arc::new(Mutex::new(HashSet::new())),
+        pending_import_covers: Arc::new(Mutex::new(HashSet::new())),
         stats: PlayStats::default(),
         queue: PlaybackQueue::default(),
         play_tracker: PlayTracker::default(),
@@ -907,6 +1001,7 @@ pub async fn run_coordinator(
     if !cold_open_uris.is_empty() {
         coord.open_uris(cold_open_uris).await;
     }
+    coord.start_startup_sync();
 
     let mut hw_poll_tick = tokio::time::interval(Duration::from_secs(1));
     hw_poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1014,24 +1109,29 @@ pub async fn run_coordinator(
                 let _ = coord.ui_tx.send(ControllerEvent::ScanFinished);
                 let resynced = job.as_ref().is_some_and(|j| j.kind == ScanKind::CoverResync);
                 if resynced {
-                    // Whatever the outcome, library.json changed under us; re-extracted covers keep
-                    // their file paths, so the UI must reload the images it holds for them.
+                    let mut seen = HashSet::new();
                     let mut cover_paths = album_cover_paths(&coord.albums);
+                    seen.extend(cover_paths.iter().cloned());
                     coord.reload_library().await;
                     for p in album_cover_paths(&coord.albums) {
-                        if !cover_paths.contains(&p) {
+                        if seen.insert(p.clone()) {
                             cover_paths.push(p);
                         }
                     }
                     let _ = coord.ui_tx.send(ControllerEvent::CoversResynced(cover_paths));
                 }
                 match scan_res {
-                    Some(Ok(summary)) => {
-                        if summary.changed() && !resynced {
+                    Some(Ok(outcome)) => {
+                        if (outcome.result.changed() || outcome.covers_migrated) && !resynced {
                             coord.reload_library().await;
                         }
+                        if !outcome.changed_paths.is_empty() && !resynced {
+                            let _ = coord
+                                .ui_tx
+                                .send(ControllerEvent::CoversInvalidated(outcome.changed_paths));
+                        }
                         if let Some(job) = job {
-                            coord.report_scan(&job, &summary);
+                            coord.report_scan(&job, &outcome.result);
                         }
                     }
                     Some(Err(err)) => {
@@ -1080,16 +1180,19 @@ pub async fn run_coordinator(
                         if res.written > 0 {
                             coord.reload_library().await;
                             if res.changes_cover {
-                                let ok_set: std::collections::HashSet<&PathBuf> =
-                                    res.ok_paths.iter().collect();
+                                let ok_set: HashSet<&PathBuf> = res.ok_paths.iter().collect();
+                                let mut seen: HashSet<PathBuf> =
+                                    res.old_covers.iter().cloned().collect();
                                 let mut new_covers = res.old_covers;
                                 for a in coord.albums.iter() {
                                     if a.tracks.iter().any(|t| ok_set.contains(&PathBuf::from(&t.file_path))) {
-                                        if let Some(p) = &a.cover_thumb_path {
-                                            new_covers.push(p.clone());
-                                        }
-                                        if let Some(p) = &a.cover_full_path {
-                                            new_covers.push(p.clone());
+                                        for p in [&a.cover_thumb_path, &a.cover_full_path]
+                                            .into_iter()
+                                            .flatten()
+                                        {
+                                            if seen.insert(p.clone()) {
+                                                new_covers.push(p.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -1124,6 +1227,12 @@ pub async fn run_coordinator(
                         });
                     }
                     None => coord.tag_done_rx = None,
+                }
+            }
+            pl_res = recv_opt(&mut coord.playlist_io_done_rx) => {
+                match pl_res {
+                    Some(done) => coord.handle_playlist_io_done(done).await,
+                    None => coord.playlist_io_done_rx = None,
                 }
             }
             _ = hw_poll_tick.tick() => {
@@ -1848,8 +1957,18 @@ impl Coordinator {
                 }
             }
             ControllerCommand::DeletePlaylist(id) => {
+                let old_cover = self
+                    .collections
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == id)
+                    .and_then(|p| p.cover_art.clone());
                 self.collections.playlists.retain(|p| p.id != id);
                 self.persist_collections();
+                if let Some(url) = old_cover {
+                    self.flush_persist().await;
+                    Self::spawn_cover_gc(url, Arc::clone(&self.live_playlist_covers));
+                }
             }
             ControllerCommand::RenamePlaylist { id, name } => {
                 let trimmed = name.trim();
@@ -1968,8 +2087,18 @@ impl Coordinator {
                     .iter()
                     .find(|p| p.id == playlist_id)
                     .and_then(|p| p.cover_art.clone());
+                let live_refs = Arc::clone(&self.live_playlist_covers);
                 match tokio::task::spawn_blocking(move || {
-                    PlaylistCovers::save(playlist_id, &image_path, prev.as_deref())
+                    let _guard = LibraryStore::write_lock()
+                        .lock()
+                        .expect("library write lock poisoned");
+                    let url = PlaylistCovers::save(&image_path).map_err(|e| e.to_string())?;
+                    if let Some(local) = CoverPaths::to_local_path(Some(&url))
+                        && let Ok(mut guard) = live_refs.lock()
+                    {
+                        guard.insert(local);
+                    }
+                    Ok::<String, String>(url)
                 })
                 .await
                 {
@@ -1980,8 +2109,16 @@ impl Coordinator {
                             .iter_mut()
                             .find(|p| p.id == playlist_id)
                         {
-                            p.cover_art = Some(url);
+                            p.cover_art = Some(url.clone());
                             self.persist_collections();
+                            if let Some(old) = prev.filter(|old| old != &url) {
+                                self.flush_persist().await;
+                                Self::spawn_cover_gc(old, Arc::clone(&self.live_playlist_covers));
+                            }
+                        } else {
+                            self.sync_live_playlist_covers();
+                            self.flush_persist().await;
+                            Self::spawn_cover_gc(url, Arc::clone(&self.live_playlist_covers));
                         }
                     }
                     Ok(Err(err)) => {
@@ -2001,9 +2138,8 @@ impl Coordinator {
                     && let Some(prev) = p.cover_art.take()
                 {
                     self.persist_collections();
-                    tokio::task::spawn_blocking(move || {
-                        PlaylistCovers::delete(Some(&prev));
-                    });
+                    self.flush_persist().await;
+                    Self::spawn_cover_gc(prev, Arc::clone(&self.live_playlist_covers));
                 }
             }
             ControllerCommand::SaveSmartPlaylist(sp) => {
@@ -2025,6 +2161,21 @@ impl Coordinator {
                     list.retain(|x| x.id != id);
                     self.persist_collections();
                 }
+            }
+            ControllerCommand::ExportPlaylistM3u8 { target, dest } => {
+                self.start_export_m3u8(target, dest);
+            }
+            ControllerCommand::ExportPlaylistZip { playlist_id, dest } => {
+                self.start_export_playlist_zip(playlist_id, dest);
+            }
+            ControllerCommand::ExportCollectionsZip { dest } => {
+                self.start_export_collections_zip(dest);
+            }
+            ControllerCommand::ImportPlaylistM3u { path } => {
+                self.start_import_m3u(path);
+            }
+            ControllerCommand::ImportCollectionsZip { path, replace } => {
+                self.start_import_zip(path, replace);
             }
             ControllerCommand::DeleteAlbums(names) => self.delete_albums(names).await,
             ControllerCommand::ScanFolders(folders) => self.scan_folders(folders).await,
@@ -2048,7 +2199,7 @@ impl Coordinator {
                     // Run it once the current scan is done rather than dropping the confirmation.
                     self.pending_prune = Some(roots);
                 } else {
-                    self.start_scan_paths(roots, ScanKind::Manual, true);
+                    self.start_scan_paths(roots, ScanKind::Manual, PrunePolicy::ForceAll);
                 }
             }
             ControllerCommand::SaveTags {
@@ -2113,11 +2264,14 @@ impl Coordinator {
                         }
                     }
 
+                    if changes_cover && !affected_names.is_empty() {
+                        self.flush_persist().await;
+                    }
                     let tx = self.tag_done_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let first_path = paths.first().cloned();
                         let (written, errs) = TagWriter::write_batch(&paths, &edit);
-                        let err_paths: std::collections::HashSet<PathBuf> =
+                        let err_paths: HashSet<PathBuf> =
                             errs.iter().map(|(p, _)| p.clone()).collect();
                         let ok_paths: Vec<PathBuf> = paths
                             .into_iter()
@@ -2140,9 +2294,10 @@ impl Coordinator {
                             let _ = Scanner::scan(
                                 &ok_paths,
                                 ScanOptions {
-                                    prune_missing: false,
+                                    prune: PrunePolicy::Never,
                                     max_threads: None,
                                     force: true,
+                                    resync_covers: false,
                                 },
                                 None,
                                 None,
@@ -2637,12 +2792,22 @@ impl Coordinator {
     /// Moves on after the current track failed to load (C# `OnPlaybackFailed`): says so, then
     /// plays the next track, at most [`MAX_FAILED_SKIPS`] times in a row.
     async fn skip_failed_track(&mut self, track: &Track, reason: &str) {
-        let missing = {
+        let (missing, rescan_target) = {
             let path = PathBuf::from(&track.file_path);
-            !tokio::task::spawn_blocking(move || path.exists())
-                .await
-                .unwrap_or(true)
+            let folders = self.settings.library_folders.clone();
+            tokio::task::spawn_blocking(move || {
+                let exists = path.exists();
+                let target = (!exists)
+                    .then(|| failed_track_rescan_target(&path, &folders))
+                    .flatten();
+                (!exists, target)
+            })
+            .await
+            .unwrap_or((false, None))
         };
+        if let Some(target) = rescan_target {
+            self.handle_watched_paths(vec![target]);
+        }
         let title = track.title.to_uppercase();
         self.notice(
             NoticeKind::Error,
@@ -3150,8 +3315,8 @@ impl Coordinator {
                 }
             }
         } else {
-            // Automatic: picks up new and changed files only, never drops anything.
-            self.start_scan_paths(paths, ScanKind::Watch, false);
+            // Automatic: picks up new/changed files and safely prunes online deletions.
+            self.start_scan_paths(paths, ScanKind::Watch, PrunePolicy::Safe);
         }
     }
 
@@ -3160,7 +3325,7 @@ impl Coordinator {
             return;
         }
         if let Some(roots) = self.pending_prune.take() {
-            self.start_scan_paths(roots, ScanKind::Manual, true);
+            self.start_scan_paths(roots, ScanKind::Manual, PrunePolicy::ForceAll);
             return;
         }
         if self.pending_cover_resync {
@@ -3172,7 +3337,7 @@ impl Coordinator {
                 self.pending_full_rescan = false;
                 self.pending_watch_paths
                     .retain(|p| !roots.iter().any(|r| p.starts_with(r)));
-                self.start_scan_paths(roots, ScanKind::CoverResync, false);
+                self.start_scan_paths(roots, ScanKind::CoverResync, PrunePolicy::Never);
                 return;
             }
         }
@@ -3183,13 +3348,21 @@ impl Coordinator {
             self.pending_watch_paths
                 .retain(|p| !roots.iter().any(|r| p.starts_with(r)));
             if !roots.is_empty() {
-                self.start_scan_paths(roots, ScanKind::Manual, false);
+                self.start_scan_paths(roots, ScanKind::Manual, PrunePolicy::Safe);
                 return;
             }
         }
+        if self.pending_startup_sync {
+            self.pending_startup_sync = false;
+            let roots = library_roots(&self.settings.library_folders, &self.albums);
+            self.pending_watch_paths
+                .retain(|p| !roots.iter().any(|r| p.starts_with(r)));
+            self.start_scan_paths(roots, ScanKind::Startup, PrunePolicy::Safe);
+            return;
+        }
         if !self.pending_watch_paths.is_empty() {
             let batch = std::mem::take(&mut self.pending_watch_paths);
-            self.start_scan_paths(batch, ScanKind::Watch, false);
+            self.start_scan_paths(batch, ScanKind::Watch, PrunePolicy::Safe);
         }
     }
 
@@ -3233,6 +3406,7 @@ impl Coordinator {
                 .send(PersistMsg::Collections(collections.clone()));
         }
         self.collections = collections.clone();
+        self.sync_live_playlist_covers();
         self.stats = stats.clone();
         let _ = self
             .ui_tx
@@ -3267,25 +3441,48 @@ impl Coordinator {
             Ok(Err(err)) => {
                 warn!(error = %err, "Failed loading library");
                 self.notice(NoticeKind::Error, format!("LIBRARY_ERROR // {err}"));
-                std::sync::Arc::from(Vec::new())
+                return;
             }
             Err(err) => {
                 warn!(error = %err, "Library load task panicked");
-                std::sync::Arc::from(Vec::new())
+                self.notice(NoticeKind::Error, format!("LIBRARY_ERROR // {err}"));
+                return;
             }
         };
         info!(albums = albums.len(), "Loaded library");
         self.albums = std::sync::Arc::clone(&albums);
         if !self.queue.is_empty() {
             let index = build_track_index(&self.albums);
-            self.queue.refresh_from_library(&index);
-            if let Some(cur) = self.queue.current().cloned() {
-                // A rescan may have produced new cover art for the current track.
-                self.load_accent_async(Some(&cur));
-                let _ = self.ui_tx.send(ControllerEvent::TrackChanged(Some(cur)));
-                self.sync_discord_rpc();
+            let (q_changed, cur_removed) = reconcile_queue_with_library(&mut self.queue, &index);
+            if cur_removed {
+                self.crossfade
+                    .cancel(&self.mpv, self.shared_vol, self.shared_muted);
+                self.emit_queue();
+                self.save_queue_async();
+                self.stop_to_idle().await;
+            } else if q_changed {
+                if let Some((tid, hint)) = self
+                    .crossfade
+                    .active_target()
+                    .map(|(id, i)| (id.to_owned(), i))
+                    && self.queue.find_track_near(hint, &tid).is_none()
+                {
+                    self.crossfade
+                        .cancel(&self.mpv, self.shared_vol, self.shared_muted);
+                }
+                self.save_queue_async();
+                self.sync_mpv_next();
+                self.sync_mpris().await;
             }
-            self.emit_queue();
+            if !cur_removed {
+                if let Some(cur) = self.queue.current().cloned() {
+                    // A rescan may have produced new cover art for the current track.
+                    self.load_accent_async(Some(&cur));
+                    let _ = self.ui_tx.send(ControllerEvent::TrackChanged(Some(cur)));
+                    self.sync_discord_rpc();
+                }
+                self.emit_queue();
+            }
         }
         let _ = self.ui_tx.send(ControllerEvent::LibraryLoaded(albums));
     }
@@ -3408,7 +3605,7 @@ impl Coordinator {
             }
             self.notice(NoticeKind::Info, "SCAN_IN_PROGRESS // FILES QUEUED");
         } else {
-            self.start_scan_paths(to_scan, ScanKind::Manual, false);
+            self.start_scan_paths(to_scan, ScanKind::Manual, PrunePolicy::Safe);
         }
     }
 
@@ -3470,6 +3667,7 @@ impl Coordinator {
             .flat_map(|a| a.tracks.iter().map(|t| t.id.clone()))
             .collect();
 
+        self.flush_persist().await;
         let names_owned = names.clone();
         let res = tokio::task::spawn_blocking(move || LibraryStore::delete_albums(&names_owned))
             .await
@@ -3540,7 +3738,7 @@ impl Coordinator {
             .iter()
             .map(PathBuf::from)
             .collect();
-        self.start_scan_paths(all_folders, ScanKind::Manual, false);
+        self.start_scan_paths(all_folders, ScanKind::Manual, PrunePolicy::Safe);
     }
 
     async fn import_paths(&mut self, paths: Vec<PathBuf>) {
@@ -3583,25 +3781,36 @@ impl Coordinator {
                     }
                 }
             } else {
-                self.start_scan_paths(to_scan, ScanKind::Manual, false);
+                self.start_scan_paths(to_scan, ScanKind::Manual, PrunePolicy::Safe);
             }
         }
     }
 
+    fn start_startup_sync(&mut self) {
+        let roots = library_roots(&self.settings.library_folders, &self.albums);
+        if self.scan_cancel.is_some() {
+            self.pending_startup_sync = true;
+            return;
+        }
+        self.start_scan_paths(roots, ScanKind::Startup, PrunePolicy::Safe);
+    }
+
     /// Starts a scan unless one is running. Only a confirmed [`ControllerCommand::PruneMissing`]
-    /// passes `prune_missing = true`; every other scan keeps tracks whose files are gone.
-    fn start_scan_paths(&mut self, paths: Vec<PathBuf>, kind: ScanKind, prune_missing: bool) {
-        if paths.is_empty() || self.scan_cancel.is_some() {
+    /// passes `PrunePolicy::ForceAll`; `Safe` prunes missing files under online directories while
+    /// leaving offline/unmounted roots untouched until the user confirms.
+    fn start_scan_paths(&mut self, paths: Vec<PathBuf>, kind: ScanKind, prune: PrunePolicy) {
+        let is_startup = kind == ScanKind::Startup;
+        if (!is_startup && paths.is_empty()) || self.scan_cancel.is_some() {
             return;
         }
         let threads = self.render_tier.scan_threads;
         let ui_tx = self.ui_tx.clone();
-        let report_progress = kind != ScanKind::Watch;
+        let report_progress = matches!(kind, ScanKind::Manual | ScanKind::CoverResync);
         let resync_covers = kind == ScanKind::CoverResync;
         if report_progress {
             let _ = ui_tx.send(ControllerEvent::Notice {
                 kind: NoticeKind::Info,
-                text: if prune_missing {
+                text: if prune == PrunePolicy::ForceAll {
                     "SCAN_STARTED // REMOVING MISSING FILES".to_owned()
                 } else if resync_covers {
                     "COVER_RESYNC_STARTED".to_owned()
@@ -3618,7 +3827,7 @@ impl Coordinator {
         self.scan_job = Some(ScanJob {
             kind,
             roots: paths.clone(),
-            prune: prune_missing,
+            prune,
         });
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -3626,21 +3835,10 @@ impl Coordinator {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         self.scan_cancel = Some(cancel);
         self.scan_done_rx = Some(done_rx);
+        let collections_snapshot = is_startup.then(|| self.collections.clone());
+        let live_playlist_covers = Arc::clone(&self.live_playlist_covers);
 
         tokio::task::spawn_blocking(move || {
-            // Inside the job so stash, re-extraction and restore run back to back, never racing
-            // another scan (`scan_cancel` is already set).
-            let stashed = if resync_covers {
-                match LibraryStore::stash_all_covers() {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        let _ = done_tx.send(Err(e.to_string()));
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
             let mut last = Instant::now();
             let mut cb = |p: rustygrade_core::ScanProgress| {
                 if report_progress && last.elapsed() >= Duration::from_millis(120) {
@@ -3652,26 +3850,44 @@ impl Coordinator {
                     });
                 }
             };
-            let result = Scanner::scan(
-                &paths,
-                ScanOptions {
-                    prune_missing,
-                    max_threads: Some(threads),
-                    // Not forced even for a resync: a forced scan rebuilds every track entry.
-                    // Covers it cannot find again are restored from the stash below.
-                    force: false,
-                },
-                Some(&cancel_worker),
-                Some(&mut cb),
-            )
-            .map_err(|e| e.to_string());
-            // Even after an error or a cancel: no album may end up with less than it had.
-            if let Some(stashed) = stashed
-                && let Err(e) = LibraryStore::restore_stashed_covers(stashed)
-            {
-                warn!(error = %e, "Restoring stashed covers failed");
-            }
-            let _ = done_tx.send(result);
+            let result = if is_startup && paths.is_empty() {
+                Ok(ScanResult::default())
+            } else {
+                Scanner::scan(
+                    &paths,
+                    ScanOptions {
+                        prune,
+                        max_threads: Some(threads),
+                        // Not forced even for a resync: tracks stay intact while stage 6
+                        // re-extracts covers in-place without disturbing unextractable covers.
+                        force: false,
+                        resync_covers,
+                    },
+                    Some(&cancel_worker),
+                    Some(&mut cb),
+                )
+                .map_err(|e| e.to_string())
+            };
+            let (covers_migrated, changed_paths) =
+                if is_startup && result.is_ok() && !cancel_worker.load(Ordering::Relaxed) {
+                    match deduplicate_and_sweep_covers(
+                        collections_snapshot.as_ref(),
+                        Some(&live_playlist_covers),
+                    ) {
+                        Ok(dedup) => (dedup.migrated_albums > 0, dedup.changed_paths),
+                        Err(err) => {
+                            warn!(error = %err, "Cover deduplication/sweep failed");
+                            (false, Vec::new())
+                        }
+                    }
+                } else {
+                    (false, Vec::new())
+                };
+            let _ = done_tx.send(result.map(|r| ScanOutcome {
+                result: r,
+                covers_migrated,
+                changed_paths,
+            }));
         });
     }
 
@@ -3682,17 +3898,290 @@ impl Coordinator {
         });
     }
 
+    fn spawn_cover_gc(url: String, live_playlist_covers: Arc<Mutex<HashSet<PathBuf>>>) {
+        Self::spawn_covers_gc(vec![url], live_playlist_covers);
+    }
+
+    fn spawn_covers_gc(urls: Vec<String>, live_playlist_covers: Arc<Mutex<HashSet<PathBuf>>>) {
+        if urls.is_empty() {
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            let mut seen = HashSet::new();
+            let mut candidates = Vec::new();
+            for url in urls {
+                let Some(local) = CoverPaths::to_local_path(Some(&url)) else {
+                    continue;
+                };
+                let thumb = PlaylistCovers::thumb_for(&local);
+                if seen.insert(local.clone()) {
+                    candidates.push(local);
+                }
+                if seen.insert(thumb.clone()) {
+                    candidates.push(thumb);
+                }
+            }
+            if candidates.is_empty() {
+                return;
+            }
+            let _guard = LibraryStore::write_lock()
+                .lock()
+                .expect("library write lock poisoned");
+            if let Ok(library) = LibraryStore::load_raw() {
+                let collections = CollectionsStore::load();
+                let extra_refs = live_playlist_covers
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                delete_unreferenced_covers_with_extra(
+                    &candidates,
+                    &library,
+                    &collections,
+                    &extra_refs,
+                );
+            }
+        });
+    }
+
+    fn resolve_m3u_export(
+        &self,
+        target: PlaylistExportTarget,
+    ) -> Result<(String, Vec<Track>), &'static str> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        resolve_m3u_export_from(&self.albums, &self.collections, &self.stats, target, now_ms)
+    }
+
+    fn start_export_m3u8(&self, target: PlaylistExportTarget, dest: PathBuf) {
+        let (name, tracks) = match self.resolve_m3u_export(target) {
+            Ok(v) => v,
+            Err(reason) => {
+                self.notice(NoticeKind::Error, format!("EXPORT_FAILED // {reason}"));
+                return;
+            }
+        };
+        let ui_tx = self.ui_tx.clone();
+        let count = tracks.len();
+        tokio::task::spawn_blocking(move || {
+            let (kind, text) = match export_m3u8_file(&dest, &name, &tracks) {
+                Ok(()) => (
+                    NoticeKind::Success,
+                    format!("EXPORTED_M3U8 // {name} ({count} TRACKS)"),
+                ),
+                Err(err) => (NoticeKind::Error, format!("EXPORT_FAILED // {err}")),
+            };
+            let _ = ui_tx.send(ControllerEvent::Notice { kind, text });
+        });
+    }
+
+    fn start_export_playlist_zip(&self, playlist_id: i64, dest: PathBuf) {
+        let Some(playlist) = self
+            .collections
+            .playlists
+            .iter()
+            .find(|p| p.id == playlist_id)
+            .cloned()
+        else {
+            self.notice(NoticeKind::Error, "EXPORT_FAILED // PLAYLIST NOT FOUND");
+            return;
+        };
+        let ui_tx = self.ui_tx.clone();
+        let name = playlist.name.clone();
+        let track_count = playlist.track_ids.len();
+        tokio::task::spawn_blocking(move || {
+            let (kind, text) = match export_playlist_zip_file(&dest, &playlist) {
+                Ok(covers) => (
+                    NoticeKind::Success,
+                    format!("EXPORTED_ZIP // {name} ({track_count} TRACKS, {covers} COVER)"),
+                ),
+                Err(err) => (NoticeKind::Error, format!("EXPORT_FAILED // {err}")),
+            };
+            let _ = ui_tx.send(ControllerEvent::Notice { kind, text });
+        });
+    }
+
+    fn start_export_collections_zip(&self, dest: PathBuf) {
+        let collections = self.collections.clone();
+        let pl_count = collections.playlists.len();
+        let liked_count = collections.liked.len();
+        let ui_tx = self.ui_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let (kind, text) = match export_collections_zip_file(&dest, &collections) {
+                Ok(covers) => (
+                    NoticeKind::Success,
+                    format!("BACKUP_EXPORTED // {pl_count} PL, {liked_count} FAV, {covers} COV"),
+                ),
+                Err(err) => (NoticeKind::Error, format!("EXPORT_FAILED // {err}")),
+            };
+            let _ = ui_tx.send(ControllerEvent::Notice { kind, text });
+        });
+    }
+
+    fn start_import_m3u(&mut self, path: PathBuf) {
+        if self.playlist_import_in_flight {
+            self.notice(
+                NoticeKind::Info,
+                "IMPORT_IN_PROGRESS // WAIT FOR CURRENT IMPORT",
+            );
+            return;
+        }
+        self.playlist_import_in_flight = true;
+        let albums = Arc::clone(&self.albums);
+        let source_roots = self.settings.library_folders.clone();
+        let guard = ImportPanicGuard::m3u(self.playlist_io_done_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let res = import_m3u_file(&path, &albums, &source_roots);
+            guard.send(PlaylistIoDone::M3u(res));
+        });
+    }
+
+    fn start_import_zip(&mut self, path: PathBuf, replace: bool) {
+        if self.playlist_import_in_flight {
+            self.notice(
+                NoticeKind::Info,
+                "IMPORT_IN_PROGRESS // WAIT FOR CURRENT IMPORT",
+            );
+            return;
+        }
+        self.playlist_import_in_flight = true;
+        let albums = Arc::clone(&self.albums);
+        let source_roots = self.settings.library_folders.clone();
+        let live_covers = Arc::clone(&self.live_playlist_covers);
+        let pending_covers = Arc::clone(&self.pending_import_covers);
+        let guard = ImportPanicGuard::zip(self.playlist_io_done_tx.clone(), replace);
+        tokio::task::spawn_blocking(move || {
+            let res = (|| -> Result<IngestedZipImport, (PlaylistIoError, Vec<PathBuf>)> {
+                let file = std::fs::File::open(&path)
+                    .map_err(|e| (PlaylistIoError::Io(e), Vec::new()))?;
+                let bundle = read_backup_zip(file).map_err(|e| (e, Vec::new()))?;
+                let prepared = prepare_zip_import(bundle, &albums, &source_roots)
+                    .map_err(|e| (e, Vec::new()))?;
+                prepared.ingest_covers(Some(&live_covers), Some(&pending_covers))
+            })();
+            guard.send(PlaylistIoDone::Zip {
+                replace,
+                result: res,
+            });
+        });
+    }
+
+    async fn handle_playlist_io_done(&mut self, done: PlaylistIoDone) {
+        self.playlist_import_in_flight = false;
+        match done {
+            PlaylistIoDone::M3u(Ok(res)) => {
+                let mut used_ids: HashSet<i64> =
+                    self.collections.playlists.iter().map(|p| p.id).collect();
+                let wanted = used_ids.iter().copied().max().unwrap_or(0).saturating_add(1);
+                let id = claim_next_id(&mut used_ids, wanted);
+                self.collections.playlists.push(PlaylistData {
+                    id,
+                    name: res.name.clone(),
+                    cover_art: None,
+                    track_ids: res.track_ids.clone(),
+                    extra: Default::default(),
+                });
+                self.persist_collections();
+                let (kind, text) = format_m3u_import_notice(&res);
+                self.notice(kind, text);
+            }
+            PlaylistIoDone::M3u(Err(err)) => {
+                let kind = if matches!(
+                    err,
+                    PlaylistIoError::EmptyPlaylist | PlaylistIoError::NoMatchingTracks { .. }
+                ) {
+                    NoticeKind::Warn
+                } else {
+                    NoticeKind::Error
+                };
+                self.notice(kind, format!("IMPORT_FAILED // {err}"));
+            }
+            PlaylistIoDone::Zip {
+                replace,
+                result: Ok(ingested),
+            } => {
+                let restored_paths = ingested.restored_cover_paths.clone();
+                let (report, old_covers, stats_changed) =
+                    ingested.apply(&mut self.collections, &mut self.stats, replace);
+                if report.collections_imported {
+                    ensure_default_smart_playlists(&mut self.collections);
+                    clear_pending_and_sync_live_covers(
+                        &self.collections,
+                        &self.live_playlist_covers,
+                        &self.pending_import_covers,
+                    );
+                    self.persist_collections();
+                } else {
+                    clear_pending_and_sync_live_covers(
+                        &self.collections,
+                        &self.live_playlist_covers,
+                        &self.pending_import_covers,
+                    );
+                }
+                if stats_changed {
+                    let _ = self.ui_tx.send(ControllerEvent::StatsUpdated(self.stats.clone()));
+                    let _ = self.persist_tx.send(PersistMsg::Stats(self.stats.clone()));
+                }
+                if !restored_paths.is_empty() {
+                    let _ = self
+                        .ui_tx
+                        .send(ControllerEvent::CoversInvalidated(restored_paths));
+                }
+                if !old_covers.is_empty() {
+                    self.flush_persist().await;
+                    Self::spawn_covers_gc(old_covers, Arc::clone(&self.live_playlist_covers));
+                }
+                let (kind, text) = format_zip_import_notice(&report);
+                self.notice(kind, text);
+            }
+            PlaylistIoDone::Zip {
+                result: Err((err, written_paths)),
+                ..
+            } => {
+                clear_pending_and_sync_live_covers(
+                    &self.collections,
+                    &self.live_playlist_covers,
+                    &self.pending_import_covers,
+                );
+                if !written_paths.is_empty() {
+                    let urls: Vec<String> = written_paths
+                        .iter()
+                        .map(|p| CoverPaths::to_file_url(p))
+                        .collect();
+                    self.flush_persist().await;
+                    Self::spawn_covers_gc(urls, Arc::clone(&self.live_playlist_covers));
+                }
+                self.notice(NoticeKind::Error, format!("IMPORT_FAILED // {err}"));
+            }
+        }
+    }
+
     /// The result toast of a finished scan (C# `RunScanAsync` / the watcher's pick-up), and the
-    /// missing-files prompt: nothing is dropped until the user confirms.
+    /// missing-files prompt: offline/suspect missing tracks are not dropped until the user confirms.
     fn report_scan(&self, job: &ScanJob, r: &ScanResult) {
         match job.kind {
+            ScanKind::Startup => {
+                if r.changed() {
+                    self.notice(NoticeKind::Success, format!("LIBRARY_SYNCED // {}", scan_summary(r)));
+                }
+                if r.missing_tracks > 0 {
+                    self.notice(
+                        NoticeKind::Warn,
+                        format!(
+                            "MISSING_FILES // {} TRACK(S) IN OFFLINE FOLDER — PRESS F5 TO REMOVE",
+                            r.missing_tracks
+                        ),
+                    );
+                }
+            }
             ScanKind::Manual => {
                 if r.changed() {
                     self.notice(NoticeKind::Success, format!("SCAN_COMPLETE // {}", scan_summary(r)));
                 } else if r.missing_tracks == 0 {
                     self.notice(NoticeKind::Info, "SCAN_COMPLETE // NO CHANGES");
                 }
-                if !job.prune && r.missing_tracks > 0 {
+                if job.prune != PrunePolicy::ForceAll && r.missing_tracks > 0 {
                     let _ = self.ui_tx.send(ControllerEvent::MissingTracks {
                         count: r.missing_tracks,
                         roots: job.roots.clone(),
@@ -3722,10 +4211,10 @@ impl Coordinator {
             self.notice(NoticeKind::Info, "SCAN_IN_PROGRESS // COVER RESYNC QUEUED");
             return;
         }
-        self.start_scan_paths(roots, ScanKind::CoverResync, false);
+        self.start_scan_paths(roots, ScanKind::CoverResync, PrunePolicy::Never);
     }
 
-    /// F5 / tray rescan: every library root, nothing dropped.
+    /// F5 / tray rescan: every library root, safely pruning online deletions; absent/offline roots ask first.
     fn rescan_library(&mut self) {
         let roots = library_roots(&self.settings.library_folders, &self.albums);
         if roots.is_empty() {
@@ -3736,11 +4225,27 @@ impl Coordinator {
             self.pending_full_rescan = true;
             self.notice(NoticeKind::Info, "SCAN_IN_PROGRESS // RESCAN QUEUED");
         } else {
-            self.start_scan_paths(roots, ScanKind::Manual, false);
+            self.start_scan_paths(roots, ScanKind::Manual, PrunePolicy::Safe);
+        }
+    }
+
+    fn sync_live_playlist_covers(&self) {
+        sync_live_playlist_covers_with_pending(
+            &self.collections,
+            &self.live_playlist_covers,
+            &self.pending_import_covers,
+        );
+    }
+
+    async fn flush_persist(&self) {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self.persist_tx.send(PersistMsg::Flush(done_tx)).is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
         }
     }
 
     fn persist_collections(&self) {
+        self.sync_live_playlist_covers();
         let data = self.collections.clone();
         let _ = self
             .ui_tx
@@ -3789,10 +4294,7 @@ impl Coordinator {
                 .persist_tx
                 .send(PersistMsg::Settings(self.settings.clone()));
         }
-        let (done_tx, done_rx) = oneshot::channel();
-        if self.persist_tx.send(PersistMsg::Flush(done_tx)).is_ok() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
-        }
+        self.flush_persist().await;
 
         self.crossfade.shutdown_async().await;
         self.mpv.shutdown_async().await;
@@ -3996,6 +4498,187 @@ impl Coordinator {
         })
         .await;
     }
+}
+
+struct ImportPanicGuard {
+    tx: Option<mpsc::UnboundedSender<PlaylistIoDone>>,
+    zip_replace: Option<bool>,
+}
+
+impl ImportPanicGuard {
+    fn m3u(tx: mpsc::UnboundedSender<PlaylistIoDone>) -> Self {
+        Self {
+            tx: Some(tx),
+            zip_replace: None,
+        }
+    }
+
+    fn zip(tx: mpsc::UnboundedSender<PlaylistIoDone>, replace: bool) -> Self {
+        Self {
+            tx: Some(tx),
+            zip_replace: Some(replace),
+        }
+    }
+
+    fn send(mut self, done: PlaylistIoDone) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(done);
+        }
+    }
+}
+
+impl Drop for ImportPanicGuard {
+    fn drop(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        let err = PlaylistIoError::Io(std::io::Error::other("import task panicked unexpectedly"));
+        let done = match self.zip_replace {
+            Some(replace) => PlaylistIoDone::Zip {
+                replace,
+                result: Err((err, Vec::new())),
+            },
+            None => PlaylistIoDone::M3u(Err(err)),
+        };
+        let _ = tx.send(done);
+    }
+}
+
+/// Strict lock order: `live` before `pending` (`LibraryStore::write_lock()` -> `live` -> `pending`).
+fn sync_live_playlist_covers_with_pending(
+    collections: &CollectionsData,
+    live: &Mutex<HashSet<PathBuf>>,
+    pending: &Mutex<HashSet<PathBuf>>,
+) {
+    let mut set = HashSet::new();
+    collect_playlist_cover_paths(collections, &mut set);
+    if let Ok(mut live_guard) = live.lock() {
+        if let Ok(pending_guard) = pending.lock() {
+            set.extend(pending_guard.iter().cloned());
+        }
+        *live_guard = set;
+    }
+}
+
+fn clear_pending_and_sync_live_covers(
+    collections: &CollectionsData,
+    live: &Mutex<HashSet<PathBuf>>,
+    pending: &Mutex<HashSet<PathBuf>>,
+) {
+    let mut set = HashSet::new();
+    collect_playlist_cover_paths(collections, &mut set);
+    if let Ok(mut live_guard) = live.lock() {
+        if let Ok(mut pending_guard) = pending.lock() {
+            pending_guard.clear();
+        }
+        *live_guard = set;
+    }
+}
+
+fn resolve_m3u_export_from(
+    albums: &[Album],
+    collections: &CollectionsData,
+    stats: &PlayStats,
+    target: PlaylistExportTarget,
+    now_ms: i64,
+) -> Result<(String, Vec<Track>), &'static str> {
+    let index = build_track_index(albums);
+    match target {
+        PlaylistExportTarget::Liked => {
+            let tracks = collections
+                .liked
+                .iter()
+                .filter_map(|id| index.get(id).map(|(t, _)| t.clone()))
+                .collect();
+            Ok(("Favorites".to_owned(), tracks))
+        }
+        PlaylistExportTarget::Custom(id) => {
+            let Some(p) = collections.playlists.iter().find(|p| p.id == id) else {
+                return Err("PLAYLIST NOT FOUND");
+            };
+            let tracks = p
+                .track_ids
+                .iter()
+                .filter_map(|tid| index.get(tid).map(|(t, _)| t.clone()))
+                .collect();
+            Ok((p.name.clone(), tracks))
+        }
+        PlaylistExportTarget::Smart(id) => {
+            let Some(sp) = collections
+                .smart
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .find(|s| s.id == id)
+            else {
+                return Err("SMART PLAYLIST NOT FOUND");
+            };
+            let liked_set: HashSet<&str> =
+                collections.liked.iter().map(String::as_str).collect();
+            let tracks = SmartPlaylists::evaluate(
+                sp,
+                albums.iter().flat_map(|a| a.tracks.iter().map(move |t| (t, a))),
+                |tid| stats.get(tid),
+                |tid| liked_set.contains(tid),
+                now_ms,
+            );
+            Ok((sp.name.clone(), tracks))
+        }
+    }
+}
+
+fn format_m3u_import_notice(res: &M3uImportResult) -> (NoticeKind, String) {
+    let matched = res.exact + res.remapped + res.metadata;
+    let mut details = vec![format!("{matched} MATCHED")];
+    if res.remapped > 0 {
+        details.push(format!("{} REMAPPED", res.remapped));
+    }
+    if res.metadata > 0 {
+        details.push(format!("{} META", res.metadata));
+    }
+    if res.unmatched > 0 {
+        details.push(format!("{} UNMATCHED", res.unmatched));
+    }
+    let kind = if res.unmatched > 0 {
+        NoticeKind::Warn
+    } else {
+        NoticeKind::Success
+    };
+    (kind, format!("IMPORTED {} // {}", res.name, details.join(", ")))
+}
+
+fn format_zip_import_notice(report: &ZipImportReport) -> (NoticeKind, String) {
+    let mut parts = Vec::new();
+    if report.collections_imported {
+        parts.push(format!("{} PL", report.playlists_imported));
+    }
+    if report.liked_added > 0 {
+        parts.push(format!("+{} FAV", report.liked_added));
+    }
+    if report.stats_imported > 0 {
+        parts.push(format!("{} STATS", report.stats_imported));
+    }
+    if report.covers_restored > 0 {
+        parts.push(format!("{} COV", report.covers_restored));
+    }
+    if report.tracks_remapped > 0 {
+        parts.push(format!("{} REMAP", report.tracks_remapped));
+    }
+    if report.tracks_unmatched > 0 {
+        parts.push(format!("{} UNMATCHED", report.tracks_unmatched));
+    }
+    if report.settings_skipped {
+        parts.push("SETTINGS SKIPPED".to_owned());
+    }
+    if parts.is_empty() {
+        parts.push("NO CHANGES".to_owned());
+    }
+    let kind = if report.tracks_unmatched > 0 {
+        NoticeKind::Warn
+    } else {
+        NoticeKind::Success
+    };
+    (kind, format!("ARCHIVE_IMPORTED // {}", parts.join(", ")))
 }
 
 #[cfg(test)]
@@ -4343,6 +5026,99 @@ mod tests {
         assert!(direct_failure_message(&[]).contains("COULD NOT BE OPENED"));
     }
 
+    #[test]
+    fn reconcile_queue_with_library_drops_missing_and_refreshes_surviving_tracks() {
+        let old_thumb = Some(PathBuf::from("/tmp/old_thumb.jpg"));
+        let new_cover = Some(PathBuf::from("/tmp/c_migrated.jpg"));
+        let make_track = |id: &str, title: &str, cover: Option<PathBuf>| Track {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            artist: "Artist".to_owned(),
+            album: "A".to_owned(),
+            duration: 180.0,
+            file_path: id.to_owned(),
+            track_number: 1,
+            disc_number: 1,
+            codec: "FLAC".to_owned(),
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            channels: 2,
+            cover_thumb_path: cover.clone(),
+            cover_full_path: cover,
+        };
+        let t1_old = make_track("/music/01.flac", "Removed Current", old_thumb.clone());
+        let t2_old = make_track("/music/02.flac", "Surviving Old Title", old_thumb);
+        let t2_new = make_track("/music/02.flac", "Surviving New Title", new_cover.clone());
+
+        let mut queue = PlaybackQueue::default();
+        queue.set_queue(vec![t1_old, t2_old], Some(0));
+
+        let updated_album = Album {
+            name: "A".to_owned(),
+            artist: "Artist".to_owned(),
+            cover_thumb_path: new_cover.clone(),
+            cover_full_path: new_cover.clone(),
+            year: 2024,
+            added_at: 0,
+            tracks: vec![t2_new.clone()],
+        };
+        let index = build_track_index(&[updated_album]);
+
+        let (q_changed, cur_removed) = reconcile_queue_with_library(&mut queue, &index);
+        assert!(q_changed);
+        assert!(cur_removed);
+        assert_eq!(queue.tracks().len(), 1);
+        assert_eq!(queue.tracks()[0].id, "/music/02.flac");
+        assert_eq!(queue.tracks()[0].title, "Surviving New Title");
+        assert_eq!(queue.tracks()[0].cover_thumb_path, new_cover);
+        assert_eq!(queue.tracks()[0].cover_full_path, new_cover);
+    }
+
+    #[test]
+    fn failed_track_rescan_target_respects_library_roots_and_walks_up_deleted_albums() {
+        let base = std::env::temp_dir().join(format!("rustygrade-failed-rescan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib_root = base.join("Music");
+        let existing_album = lib_root.join("ExistingAlbum");
+        let deleted_album = lib_root.join("DeletedAlbum");
+        let outside_dir = base.join("Outside");
+        std::fs::create_dir_all(&existing_album).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let folders = vec![
+            lib_root.to_string_lossy().into_owned(),
+            base.join("MissingRoot").to_string_lossy().into_owned(),
+        ];
+
+        // File missing inside existing album dir -> rescans album dir.
+        let target = failed_track_rescan_target(&existing_album.join("01.flac"), &folders).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&target).unwrap(),
+            std::fs::canonicalize(&existing_album).unwrap()
+        );
+
+        // Entire album folder deleted -> walks up to library root.
+        let target_up = failed_track_rescan_target(&deleted_album.join("01.flac"), &folders).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&target_up).unwrap(),
+            std::fs::canonicalize(&lib_root).unwrap()
+        );
+
+        // Loose file outside configured library folders -> None (does not scan unrelated dirs).
+        assert_eq!(
+            failed_track_rescan_target(&outside_dir.join("loose.flac"), &folders),
+            None
+        );
+
+        // File under absent/unmounted library root -> None.
+        assert_eq!(
+            failed_track_rescan_target(&base.join("MissingRoot/Album/01.flac"), &folders),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Bug 1 on real hardware, with digital silence and the card's own volume at its minimum:
     /// one track goes shared → direct (taken the old way, straight after the reservation) →
     /// shared → direct (taken the fixed way, after the card is closed). Prints whether the old way
@@ -4448,5 +5224,267 @@ mod tests {
             assert!(free.is_ok());
             assert!(!failed && opened && hw.is_some(), "direct output did not open");
         });
+    }
+
+    #[test]
+    fn playlist_import_notices_summarize_counts_and_warn_when_unmatched() {
+        let ok = M3uImportResult {
+            name: "Roadtrip".to_owned(),
+            track_ids: vec!["/a.flac".to_owned(), "/b.flac".to_owned()],
+            exact: 1,
+            remapped: 1,
+            metadata: 0,
+            unmatched: 0,
+            total_entries: 2,
+        };
+        let (kind, text) = format_m3u_import_notice(&ok);
+        assert_eq!(kind, NoticeKind::Success);
+        assert_eq!(text, "IMPORTED Roadtrip // 2 MATCHED, 1 REMAPPED");
+
+        let partial = M3uImportResult {
+            name: "Mixed".to_owned(),
+            track_ids: vec!["/a.flac".to_owned()],
+            exact: 0,
+            remapped: 0,
+            metadata: 1,
+            unmatched: 2,
+            total_entries: 3,
+        };
+        let (kind, text) = format_m3u_import_notice(&partial);
+        assert_eq!(kind, NoticeKind::Warn);
+        assert_eq!(text, "IMPORTED Mixed // 1 MATCHED, 1 META, 2 UNMATCHED");
+
+        let zip_report = ZipImportReport {
+            collections_imported: true,
+            liked_added: 3,
+            liked_total: 10,
+            playlists_imported: 2,
+            playlists_total: 4,
+            smart_playlists_imported: 1,
+            stats_imported: 12,
+            settings_skipped: true,
+            tracks_exact: 5,
+            tracks_remapped: 2,
+            tracks_unmatched: 1,
+            covers_restored: 2,
+        };
+        let (zkind, ztext) = format_zip_import_notice(&zip_report);
+        assert_eq!(zkind, NoticeKind::Warn);
+        assert_eq!(
+            ztext,
+            "ARCHIVE_IMPORTED // 2 PL, +3 FAV, 12 STATS, 2 COV, 2 REMAP, 1 UNMATCHED, SETTINGS SKIPPED"
+        );
+
+        let stats_only = ZipImportReport {
+            stats_imported: 5,
+            ..Default::default()
+        };
+        let (skind, stext) = format_zip_import_notice(&stats_only);
+        assert_eq!(skind, NoticeKind::Success);
+        assert_eq!(stext, "ARCHIVE_IMPORTED // 5 STATS");
+    }
+
+    #[test]
+    fn import_panic_guard_delivers_error_on_panic_and_clears_when_sent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Simulate unwinding panic in M3U worker.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ImportPanicGuard::m3u(tx.clone());
+            panic!("boom m3u");
+        }));
+        match rx.try_recv().unwrap() {
+            PlaylistIoDone::M3u(Err(err)) => {
+                assert!(err.to_string().contains("panicked"));
+            }
+            _ => panic!("expected M3u Err on panic"),
+        }
+
+        // Simulate unwinding panic in ZIP worker.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ImportPanicGuard::zip(tx.clone(), true);
+            panic!("boom zip");
+        }));
+        match rx.try_recv().unwrap() {
+            PlaylistIoDone::Zip {
+                replace: true,
+                result: Err((err, written)),
+            } => {
+                assert!(err.to_string().contains("panicked"));
+                assert!(written.is_empty());
+            }
+            _ => panic!("expected Zip Err on panic"),
+        }
+
+        // Normal send consumes the guard without sending a duplicate on drop.
+        let guard = ImportPanicGuard::m3u(tx);
+        guard.send(PlaylistIoDone::M3u(Err(PlaylistIoError::EmptyPlaylist)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PlaylistIoDone::M3u(Err(PlaylistIoError::EmptyPlaylist))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_import_covers_survive_collection_sync_until_cleared() {
+        let live = Mutex::new(HashSet::new());
+        let pending = Mutex::new(HashSet::new());
+
+        let existing_path = PathBuf::from("/tmp/covers/c_111111111111111111111111.png");
+        let imported_path = PathBuf::from("/tmp/covers/c_222222222222222222222222.png");
+
+        let mut collections = CollectionsData {
+            playlists: vec![PlaylistData {
+                id: 1,
+                name: "Existing".to_owned(),
+                cover_art: Some(CoverPaths::to_file_url(&existing_path)),
+                track_ids: vec![],
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        };
+
+        // Import phase registers `imported_path` in both `live` and `pending`.
+        live.lock().unwrap().insert(imported_path.clone());
+        pending.lock().unwrap().insert(imported_path.clone());
+
+        // User concurrently likes a track -> `persist_collections` syncs `live_playlist_covers`.
+        collections.liked.push("/music/song.flac".to_owned());
+        sync_live_playlist_covers_with_pending(&collections, &live, &pending);
+
+        let live_snapshot = live.lock().unwrap().clone();
+        assert!(live_snapshot.contains(&existing_path));
+        assert!(
+            live_snapshot.contains(&imported_path),
+            "pending import cover must stay protected across concurrent persist_collections()"
+        );
+
+        // Once import applies (or rolls back), clearing pending removes pins no longer in collections.
+        clear_pending_and_sync_live_covers(&collections, &live, &pending);
+        assert!(pending.lock().unwrap().is_empty());
+        let live_after = live.lock().unwrap().clone();
+        assert!(live_after.contains(&existing_path));
+        assert!(!live_after.contains(&imported_path));
+    }
+
+    #[test]
+    fn resolve_m3u_export_from_handles_liked_custom_and_smart_playlists() {
+        let t1 = Track {
+            id: "/music/t1.flac".to_owned(),
+            title: "One".to_owned(),
+            artist: "Art".to_owned(),
+            album: "Alb".to_owned(),
+            duration: 180.0,
+            file_path: "/music/t1.flac".to_owned(),
+            track_number: 1,
+            disc_number: 1,
+            codec: "FLAC".to_owned(),
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            channels: 2,
+            cover_thumb_path: None,
+            cover_full_path: None,
+        };
+        let t2 = Track {
+            id: "/music/t2.flac".to_owned(),
+            title: "Two".to_owned(),
+            file_path: "/music/t2.flac".to_owned(),
+            ..t1.clone()
+        };
+        let albums = vec![Album {
+            name: "Alb".to_owned(),
+            artist: "Art".to_owned(),
+            cover_thumb_path: None,
+            cover_full_path: None,
+            year: 2024,
+            added_at: 1,
+            tracks: vec![t1.clone(), t2.clone()],
+        }];
+        let collections = CollectionsData {
+            liked: vec![t2.id.clone()],
+            playlists: vec![PlaylistData {
+                id: 7,
+                name: "Custom Mix".to_owned(),
+                cover_art: None,
+                track_ids: vec![t1.id.clone(), t2.id.clone()],
+                extra: Default::default(),
+            }],
+            smart: Some(vec![SmartPlaylistData {
+                id: 3,
+                name: "Frequent".to_owned(),
+                match_all: true,
+                rules: vec![rustygrade_core::SmartRule {
+                    field: "plays".to_owned(),
+                    op: "gte".to_owned(),
+                    value: "2".to_owned(),
+                }],
+                sort: "album".to_owned(),
+                limit: 0,
+                extra: Default::default(),
+            }]),
+            ..Default::default()
+        };
+        let mut stats = PlayStats::default();
+        stats.tracks.insert(
+            t1.id.clone(),
+            rustygrade_core::PlayStat {
+                count: 5,
+                last: 100,
+            },
+        );
+        stats.tracks.insert(
+            t2.id.clone(),
+            rustygrade_core::PlayStat {
+                count: 1,
+                last: 50,
+            },
+        );
+
+        let (liked_name, liked_tracks) = resolve_m3u_export_from(
+            &albums,
+            &collections,
+            &stats,
+            PlaylistExportTarget::Liked,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(liked_name, "Favorites");
+        assert_eq!(liked_tracks.len(), 1);
+        assert_eq!(liked_tracks[0].id, t2.id);
+
+        let (custom_name, custom_tracks) = resolve_m3u_export_from(
+            &albums,
+            &collections,
+            &stats,
+            PlaylistExportTarget::Custom(7),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(custom_name, "Custom Mix");
+        assert_eq!(custom_tracks.len(), 2);
+
+        let (smart_name, smart_tracks) = resolve_m3u_export_from(
+            &albums,
+            &collections,
+            &stats,
+            PlaylistExportTarget::Smart(3),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(smart_name, "Frequent");
+        assert_eq!(smart_tracks.len(), 1);
+        assert_eq!(smart_tracks[0].id, t1.id);
+
+        assert!(
+            resolve_m3u_export_from(
+                &albums,
+                &collections,
+                &stats,
+                PlaylistExportTarget::Custom(999),
+                1000,
+            )
+            .is_err()
+        );
     }
 }

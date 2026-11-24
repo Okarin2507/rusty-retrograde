@@ -6,6 +6,7 @@ pub mod library;
 pub mod lyrics;
 pub mod models;
 pub mod paths;
+pub mod playlist_io;
 pub mod scanner;
 pub mod session;
 pub mod settings;
@@ -13,19 +14,33 @@ pub mod smart;
 pub mod stats;
 pub mod tag_writer;
 pub mod watcher;
+pub mod zip_archive;
 
 pub use collections::{
     CollectionsData, CollectionsStore, ExtraMap, PlaylistData, SmartPlaylistData, SmartRule,
 };
 pub use covers::{
-    CoverPalette, ImageLimits, MIN_ACCENT_LUMINANCE, PlaylistCovers, extract_cover_palette,
-    extract_cover_palette_from_rgb, relative_luminance,
+    CoverDedupResult, CoverPalette, ImageLimits, MIN_ACCENT_LUMINANCE, PlaylistCovers,
+    PreparedCover, SavedCover, collect_playlist_cover_paths, deduplicate_and_sweep_covers,
+    delete_unreferenced_covers, delete_unreferenced_covers_with_extra, extract_cover_palette,
+    extract_cover_palette_from_rgb, migrate_playlist_covers, prepare_cover_bytes,
+    relative_luminance, save_cover_bytes, write_prepared_cover,
 };
-pub use library::{AlbumDto, LibraryStore, StashedCover, TrackDto, reorder_by_ids, with_album_track_order};
+pub use library::{AlbumDto, LibraryStore, TrackDto, reorder_by_ids, with_album_track_order};
 pub use lyrics::{LyricLine, LyricsDoc, LyricsLoader};
 pub use models::{Album, ArtistSummary, Track};
 pub use paths::CoverPaths;
-pub use scanner::{ScanProgress, ScanResult, Scanner};
+pub use playlist_io::{
+    BackupBundle, BackupCoverFile, IngestedZipImport, M3uEntry, M3uImportResult, MapOutcome,
+    ParsedM3u, PlaylistIoError, PreparedZipImport, TrackPathMapper, ZipArchiveSummary,
+    ZipImportReport, android_export_cover_name, build_collections_backup_bundle,
+    build_single_playlist_backup_bundle, claim_next_id, export_collections_zip_file,
+    export_m3u8_file, export_playlist_zip_file, format_m3u8, import_m3u_file, import_m3u_str,
+    inspect_backup_zip, inspect_backup_zip_file, is_android_cover_filename,
+    is_content_cover_filename, normalize_path_segments, parse_m3u, prepare_zip_import,
+    read_backup_zip, suggest_export_filename, write_backup_zip,
+};
+pub use scanner::{PrunePolicy, ScanOptions, ScanProgress, ScanResult, Scanner};
 pub use session::{SessionState, SessionStore};
 pub use settings::{
     AppSettings, DirectVolumeBridge, DisplayBackend, GpuPreference, LIBRARY_SORT_KEYS,
@@ -34,7 +49,7 @@ pub use settings::{
 pub use smart::{Codecs, SmartField, SmartPlaylists};
 pub use stats::{PlayStat, PlayStats};
 pub use tag_writer::{TagEdit, TagWriter};
-pub use watcher::FolderWatcher;
+pub use watcher::{FolderWatcher, nearest_watched_ancestor};
 
 #[cfg(test)]
 mod tests {
@@ -75,11 +90,11 @@ mod tests {
             })
             .unwrap_or_default();
 
-        // Check cover hashes match actual cover files on disk when present.
+        // Check cover files on disk exist when referenced.
         let mut matched_covers = 0usize;
         for album in &albums {
-            if CoverPaths::thumb_path(&album.name).exists()
-                || CoverPaths::full_path(&album.name).exists()
+            if album.cover_thumb_path.as_deref().is_some_and(std::path::Path::exists)
+                || album.cover_full_path.as_deref().is_some_and(std::path::Path::exists)
             {
                 matched_covers += 1;
             }

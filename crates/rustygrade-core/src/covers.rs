@@ -1,17 +1,22 @@
-use std::fs;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::io::Cursor;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use fast_image_resize::images::Image as FirImage;
 use fast_image_resize::{FilterType, IntoImageView, ResizeAlg, ResizeOptions, Resizer};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::metadata::Orientation;
-use image::{ColorType, DynamicImage, ImageDecoder, ImageEncoder, ImageReader};
+use image::{ColorType, DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use thiserror::Error;
 
-use crate::library::try_delete;
+use crate::collections::{CollectionsData, CollectionsStore};
+use crate::library::{LibraryError, LibraryMap, LibraryStore, try_delete};
 use crate::paths::CoverPaths;
 
 pub const MAX_COVER_FILE_BYTES: u64 = 30 * 1024 * 1024;
@@ -74,22 +79,6 @@ impl ImageLimits {
 /// with the thumbnails; it still covers the 510px full-screen cover at scale 1.
 pub const MAX_FULL_COVER_EDGE: u32 = 720;
 
-/// Decodes an image and applies its EXIF orientation, so a re-encoded copy (which carries no
-/// EXIF) still shows upright. A missing or unreadable orientation tag leaves the image as is.
-pub(crate) fn decode_oriented<R: std::io::BufRead + std::io::Seek>(
-    reader: ImageReader<R>,
-) -> Result<DynamicImage, CoverError> {
-    let mut decoder = reader
-        .with_guessed_format()
-        .map_err(|e| CoverError::Image(e.to_string()))?
-        .into_decoder()
-        .map_err(|e| CoverError::Image(e.to_string()))?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| CoverError::Image(e.to_string()))?;
-    img.apply_orientation(orientation);
-    Ok(img)
-}
-
 /// Size of `w` x `h` fitted within `max_edge` x `max_edge`, preserving aspect ratio.
 fn capped_dims(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
     if max_edge == 0 || w.max(h) <= max_edge {
@@ -106,18 +95,26 @@ fn capped_dims(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
 }
 
 /// Encodes a full-size cover fitted within `max_edge`. Opaque images become JPEG; images with
-/// an alpha channel become PNG so transparency survives (the cover loaders sniff the format
-/// from the bytes, so PNG data in a `_full.jpg` file still loads).
+/// an alpha channel become PNG so transparency survives. Returns `(bytes, extension)`.
+pub(crate) fn encode_capped_full_with_ext(
+    img: &DynamicImage,
+    max_edge: u32,
+    quality: u8,
+) -> Result<(Vec<u8>, &'static str), CoverError> {
+    if img.color().has_alpha() {
+        Ok((encode_capped_png(img, max_edge)?, "png"))
+    } else {
+        Ok((encode_capped_jpeg(img, max_edge, quality)?, "jpg"))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn encode_capped_full(
     img: &DynamicImage,
     max_edge: u32,
     quality: u8,
 ) -> Result<Vec<u8>, CoverError> {
-    if img.color().has_alpha() {
-        encode_capped_png(img, max_edge)
-    } else {
-        encode_capped_jpeg(img, max_edge, quality)
-    }
+    encode_capped_full_with_ext(img, max_edge, quality).map(|(bytes, _)| bytes)
 }
 
 /// Encode `img` as JPEG fitted within `max_edge` x `max_edge`, preserving aspect ratio.
@@ -154,22 +151,6 @@ fn encode_capped_png(img: &DynamicImage, max_edge: u32) -> Result<Vec<u8>, Cover
     Ok(out)
 }
 
-pub(crate) fn encode_resized_jpeg(
-    img: &DynamicImage,
-    max_width: u32,
-    quality: u8,
-) -> Result<Vec<u8>, CoverError> {
-    let (src_w, src_h) = (img.width(), img.height());
-    if src_w > max_width && max_width > 0 {
-        let dst_h = ((src_h as f64) * (max_width as f64 / src_w as f64))
-            .round()
-            .max(1.0) as u32;
-        encode_to_size(img, max_width, dst_h, quality)
-    } else {
-        encode_to_size(img, src_w, src_h, quality)
-    }
-}
-
 fn encode_to_size(
     img: &DynamicImage,
     dst_w: u32,
@@ -200,57 +181,222 @@ fn encode_to_size(
     Ok(out)
 }
 
-/// Shrinks stored `*_full.jpg` covers in `dir` whose longest side exceeds `max_edge` (covers
-/// saved before import was capped, or by the C# build). Only image headers are read for covers
-/// already within the cap, so this is cheap to run on every start. Each file is replaced
-/// atomically (temp file + rename); a cover that cannot be read or re-encoded is left alone.
-/// Returns the paths that were rewritten.
-pub fn shrink_oversized_full_covers(dir: &Path, max_edge: u32) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut changed = Vec::new();
-    for path in entries.flatten().map(|e| e.path()) {
-        let is_full = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.to_ascii_lowercase().ends_with("_full.jpg"));
-        if !is_full || !path.is_file() {
-            continue;
-        }
-        let dims = ImageReader::open(&path)
-            .and_then(|r| r.with_guessed_format())
-            .ok()
-            .and_then(|r| r.into_dimensions().ok());
-        let Some((w, h)) = dims else { continue };
-        if w.max(h) <= max_edge || !ImageLimits::is_sane_path(&path) {
-            continue;
-        }
-        match shrink_one(&path, max_edge) {
-            Ok(()) => changed.push(path),
-            Err(e) => tracing::warn!(path = %path.display(), error = %e, "Could not shrink cover"),
-        }
+static COVER_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn compress_sha256_block(h: &mut [u32; 8], block: &[u8; 64]) {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    let mut w = [0u32; 64];
+    for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+        w[i] = u32::from_be_bytes(*word);
     }
-    changed
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
 }
 
-fn shrink_one(path: &Path, max_edge: u32) -> Result<(), CoverError> {
-    let img = decode_oriented(ImageReader::open(path)?)?;
-    let bytes = encode_capped_full(&img, max_edge, 90)?;
-    let tmp = path.with_extension("jpg.shrink-tmp");
-    fs::write(&tmp, bytes)?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.into());
+/// FIPS 180-4 SHA-256 digest of `data`.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    let (blocks, rem) = data.as_chunks::<64>();
+    for block in blocks {
+        compress_sha256_block(&mut h, block);
     }
-    Ok(())
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let tail_len = if rem.len() < 56 { 64 } else { 128 };
+    let mut tail = [0u8; 128];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_be_bytes());
+    for block in tail[..tail_len].as_chunks::<64>().0 {
+        compress_sha256_block(&mut h, block);
+    }
+
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// First 12 bytes (24 lowercase hex characters) of `sha256(data)`.
+pub fn sha256_hex_prefix(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = sha256(data);
+    let mut out = String::with_capacity(24);
+    for &b in &digest[..12] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Normalized, hashed cover image ready to be persisted into `CoverPaths::cover_dir()`.
+#[derive(Debug, Clone)]
+pub struct PreparedCover {
+    bytes: Vec<u8>,
+    hash: String,
+    ext: &'static str,
+}
+
+/// Result of writing a content-addressed cover file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedCover {
+    pub path: PathBuf,
+    /// `true` when this call newly created `path` on disk; `false` when identical content already existed.
+    pub created: bool,
+}
+
+fn prepare_cover_cow(data: &[u8]) -> Result<(Cow<'_, [u8]>, String, &'static str), CoverError> {
+    if !ImageLimits::is_sane_bytes(data) {
+        return Err(CoverError::InsaneImage);
+    }
+    let reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| CoverError::Image(e.to_string()))?;
+    let fmt = reader.format();
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| CoverError::Image(e.to_string()))?;
+    let (w, h) = decoder.dimensions();
+    let orient = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+
+    let (final_bytes, ext): (Cow<'_, [u8]>, &'static str) = if w.max(h) <= MAX_FULL_COVER_EDGE
+        && orient == Orientation::NoTransforms
+        && matches!(fmt, Some(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP))
+    {
+        let ext = match fmt {
+            Some(ImageFormat::Png) => "png",
+            Some(ImageFormat::WebP) => "webp",
+            _ => "jpg",
+        };
+        (Cow::Borrowed(data), ext)
+    } else {
+        let mut img =
+            DynamicImage::from_decoder(decoder).map_err(|e| CoverError::Image(e.to_string()))?;
+        img.apply_orientation(orient);
+        let (encoded, ext) = encode_capped_full_with_ext(&img, MAX_FULL_COVER_EDGE, 90)?;
+        (Cow::Owned(encoded), ext)
+    };
+
+    let hash = sha256_hex_prefix(&final_bytes);
+    Ok((final_bytes, hash, ext))
+}
+
+fn write_cover_bytes(
+    final_bytes: &[u8],
+    hash: &str,
+    ext: &'static str,
+) -> Result<SavedCover, CoverError> {
+    let dest = CoverPaths::content_cover_path(hash, ext);
+    let cover_dir = CoverPaths::cover_dir();
+    fs::create_dir_all(&cover_dir)?;
+    let mut created = false;
+    if !dest.exists() {
+        let seq = COVER_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = cover_dir.join(format!("c_{hash}.{ext}.tmp.{}.{seq}", std::process::id()));
+        if let Err(e) = fs::write(&tmp, final_bytes) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = fs::rename(&tmp, &dest) {
+            let _ = fs::remove_file(&tmp);
+            if !dest.exists() {
+                return Err(e.into());
+            }
+        } else {
+            created = true;
+        }
+    } else if let Ok(file) = OpenOptions::new().write(true).open(&dest) {
+        // Keep mtime current so a concurrent GC grace window treats reused covers as active.
+        let _ = file.set_modified(SystemTime::now());
+    }
+    Ok(SavedCover {
+        path: dest,
+        created,
+    })
+}
+
+/// Decodes, EXIF-orients, downscales if needed, and hashes cover image bytes in memory without
+/// holding any store lock or writing to disk.
+pub fn prepare_cover_bytes(data: &[u8]) -> Result<PreparedCover, CoverError> {
+    let (bytes, hash, ext) = prepare_cover_cow(data)?;
+    Ok(PreparedCover {
+        bytes: bytes.into_owned(),
+        hash,
+        ext,
+    })
+}
+
+/// Writes a previously prepared cover into `CoverPaths::cover_dir()`, returning whether a new
+/// file was created on disk.
+pub fn write_prepared_cover(prepared: &PreparedCover) -> Result<SavedCover, CoverError> {
+    write_cover_bytes(&prepared.bytes, &prepared.hash, prepared.ext)
+}
+
+/// Normalizes cover bytes to <= `MAX_FULL_COVER_EDGE` (applying EXIF orientation) and writes a
+/// single content-addressed file `c_<hash>.<ext>` under `CoverPaths::cover_dir()`, skipping the write
+/// if identical bytes already exist on disk.
+pub fn save_cover_bytes(data: &[u8]) -> Result<PathBuf, CoverError> {
+    let (final_bytes, hash, ext) = prepare_cover_cow(data)?;
+    Ok(write_cover_bytes(&final_bytes, &hash, ext)?.path)
 }
 
 pub struct PlaylistCovers;
 
 impl PlaylistCovers {
     pub const EXTENSIONS: &'static [&'static str] = &["jpg", "jpeg", "png", "webp"];
-    const PREFIX: &'static str = "native_pl_";
 
     pub fn is_supported_ext(path: &Path) -> bool {
         path.extension()
@@ -258,49 +404,16 @@ impl PlaylistCovers {
             .is_some_and(|e| Self::EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
     }
 
-    pub fn save(
-        playlist_id: i64,
-        source_path: &Path,
-        previous_cover_art: Option<&str>,
-    ) -> Result<String, CoverError> {
+    pub fn save(source_path: &Path) -> Result<String, CoverError> {
         if !Self::is_supported_ext(source_path) {
             return Err(CoverError::UnsupportedFormat);
         }
         if !ImageLimits::is_sane_path(source_path) {
             return Err(CoverError::InsaneImage);
         }
-        let img = decode_oriented(ImageReader::open(source_path)?)?;
-
-        fs::create_dir_all(CoverPaths::cover_dir())?;
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let stem = CoverPaths::cover_dir().join(format!("{}{}_{}", Self::PREFIX, playlist_id, ms));
-        let full = Path::new(&format!("{}_full.jpg", stem.display())).to_path_buf();
-        let thumb = Path::new(&format!("{}_thumb.jpg", stem.display())).to_path_buf();
-
-        let full_bytes = encode_capped_full(&img, MAX_FULL_COVER_EDGE, 92)?;
-        let thumb_bytes = encode_resized_jpeg(&img, 300, 80)?;
-        fs::write(&full, full_bytes)?;
-        fs::write(&thumb, thumb_bytes)?;
-
-        Self::delete(previous_cover_art);
-        Ok(CoverPaths::to_file_url(&full))
-    }
-
-    pub fn delete(cover_art: Option<&str>) {
-        let Some(full) = CoverPaths::to_local_path(cover_art) else {
-            return;
-        };
-        let Some(name) = full.file_name().and_then(|n| n.to_str()) else {
-            return;
-        };
-        if !name.starts_with(Self::PREFIX) {
-            return;
-        }
-        try_delete(&full);
-        try_delete(&Self::thumb_for(&full));
+        let bytes = fs::read(source_path)?;
+        let path = save_cover_bytes(&bytes)?;
+        Ok(CoverPaths::to_file_url(&path))
     }
 
     pub fn thumb_for(full_path: &Path) -> std::path::PathBuf {
@@ -308,11 +421,219 @@ impl PlaylistCovers {
         if s.len() >= "_full.jpg".len()
             && s[s.len() - "_full.jpg".len()..].eq_ignore_ascii_case("_full.jpg")
         {
-            std::path::PathBuf::from(format!("{}_thumb.jpg", &s[..s.len() - "_full.jpg".len()]))
-        } else {
-            full_path.to_path_buf()
+            let sibling =
+                std::path::PathBuf::from(format!("{}_thumb.jpg", &s[..s.len() - "_full.jpg".len()]));
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+        full_path.to_path_buf()
+    }
+}
+
+/// Collects every playlist cover path (and any legacy `_thumb.jpg` sibling) from `collections`.
+pub fn collect_playlist_cover_paths(collections: &CollectionsData, out: &mut HashSet<PathBuf>) {
+    for pl in &collections.playlists {
+        if let Some(p) = CoverPaths::to_local_path(pl.cover_art.as_deref()) {
+            let thumb = PlaylistCovers::thumb_for(&p);
+            if thumb != p {
+                out.insert(thumb);
+            }
+            out.insert(p);
         }
     }
+}
+
+/// Every cover file path referenced by albums in `library` or playlists in `collections`.
+pub fn referenced_cover_paths(
+    library: &LibraryMap,
+    collections: &CollectionsData,
+) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    for album in library.values() {
+        if let Some(p) = CoverPaths::to_local_path(album.cover_art.as_deref()) {
+            set.insert(p);
+        }
+        if let Some(p) = CoverPaths::to_local_path(album.cover_art_full.as_deref()) {
+            set.insert(p);
+        }
+    }
+    collect_playlist_cover_paths(collections, &mut set);
+    set
+}
+
+/// Deletes any managed cover file in `candidates` that is no longer referenced in `library`,
+/// `collections`, or `extra_refs`.
+pub fn delete_unreferenced_covers_with_extra(
+    candidates: &[PathBuf],
+    library: &LibraryMap,
+    collections: &CollectionsData,
+    extra_refs: &HashSet<PathBuf>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let mut referenced = referenced_cover_paths(library, collections);
+    referenced.extend(extra_refs.iter().cloned());
+    for p in candidates {
+        if CoverPaths::is_managed_cover_file(p) && !referenced.contains(p) {
+            try_delete(p);
+        }
+    }
+}
+
+/// Deletes any managed cover file in `candidates` that is no longer referenced in `library` or `collections`.
+pub fn delete_unreferenced_covers(
+    candidates: &[PathBuf],
+    library: &LibraryMap,
+    collections: &CollectionsData,
+) {
+    delete_unreferenced_covers_with_extra(candidates, library, collections, &HashSet::new());
+}
+
+/// Migrates legacy playlist covers stored under `CoverPaths::cover_dir()` to single-file
+/// content-addressed covers (`c_<hash>.<ext>`). Returns `true` if `collections` changed.
+pub fn migrate_playlist_covers(collections: &mut CollectionsData) -> bool {
+    let cover_dir = CoverPaths::cover_dir();
+    let mut changed = false;
+    for pl in &mut collections.playlists {
+        let Some(local) = CoverPaths::to_local_path(pl.cover_art.as_deref()) else {
+            continue;
+        };
+        if local.parent() != Some(cover_dir.as_path()) {
+            continue;
+        }
+        if CoverPaths::is_content_cover_file(&local) && local.is_file() {
+            continue;
+        }
+        if !local.is_file() {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(&local)
+            && let Ok(new_path) = save_cover_bytes(&bytes)
+        {
+            let url = CoverPaths::to_file_url(&new_path);
+            if pl.cover_art.as_deref() != Some(url.as_str()) {
+                pl.cover_art = Some(url);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CoverDedupResult {
+    pub migrated_albums: usize,
+    pub removed_files: usize,
+    pub changed_paths: Vec<PathBuf>,
+}
+
+/// Migrates legacy dual-file (`_thumb.jpg` / `_full.jpg`) or oversized album covers to deduplicated
+/// single-file content-addressed covers, then deletes unreferenced managed files in `cover_dir`.
+pub fn deduplicate_and_sweep_covers(
+    extra_collections: Option<&CollectionsData>,
+    extra_refs: Option<&Mutex<HashSet<PathBuf>>>,
+) -> Result<CoverDedupResult, LibraryError> {
+    let _guard = LibraryStore::write_lock()
+        .lock()
+        .expect("library write lock poisoned");
+    let sweep_started = SystemTime::now();
+    let pre_collections = CollectionsStore::load();
+    let mut library = LibraryStore::load_raw()?;
+    let mut explicitly_replaced: HashSet<PathBuf> = HashSet::new();
+    let mut checked_ok: HashSet<PathBuf> = HashSet::new();
+    let mut result = CoverDedupResult::default();
+
+    for album in library.values_mut() {
+        let thumb = CoverPaths::to_local_path(album.cover_art.as_deref());
+        let full = CoverPaths::to_local_path(album.cover_art_full.as_deref());
+
+        if thumb.is_some()
+            && thumb == full
+            && let Some(p) = thumb.as_deref()
+        {
+            if checked_ok.contains(p) {
+                continue;
+            }
+            if CoverPaths::is_content_cover_file(p) && p.is_file() {
+                let within_cap = ImageReader::open(p)
+                    .and_then(|r| r.with_guessed_format())
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+                    .is_some_and(|(w, h)| w.max(h) <= MAX_FULL_COVER_EDGE);
+                if within_cap {
+                    checked_ok.insert(p.to_path_buf());
+                    continue;
+                }
+            }
+        }
+
+        let src = full
+            .as_deref()
+            .filter(|p| p.is_file())
+            .or_else(|| thumb.as_deref().filter(|p| p.is_file()));
+        if let Some(src_path) = src {
+            if let Ok(bytes) = fs::read(src_path)
+                && let Ok(new_path) = save_cover_bytes(&bytes)
+            {
+                checked_ok.insert(new_path.clone());
+                let url = CoverPaths::to_file_url(&new_path);
+                for old in [thumb.as_ref(), full.as_ref()].into_iter().flatten() {
+                    if old != &new_path {
+                        explicitly_replaced.insert(old.clone());
+                        if !result.changed_paths.contains(old) {
+                            result.changed_paths.push(old.clone());
+                        }
+                    }
+                }
+                if !result.changed_paths.contains(&new_path) {
+                    result.changed_paths.push(new_path.clone());
+                }
+                album.cover_art = Some(url.clone());
+                album.cover_art_full = Some(url);
+                result.migrated_albums += 1;
+            }
+        } else if album.cover_art.is_some() || album.cover_art_full.is_some() {
+            album.cover_art = None;
+            album.cover_art_full = None;
+            result.migrated_albums += 1;
+        }
+    }
+
+    if result.migrated_albums > 0 {
+        LibraryStore::save_raw(&library)?;
+    }
+
+    let post_collections = CollectionsStore::load();
+    let mut referenced = referenced_cover_paths(&library, &pre_collections);
+    collect_playlist_cover_paths(&post_collections, &mut referenced);
+    if let Some(c) = extra_collections {
+        collect_playlist_cover_paths(c, &mut referenced);
+    }
+    if let Some(refs) = extra_refs
+        && let Ok(guard) = refs.lock()
+    {
+        referenced.extend(guard.iter().cloned());
+    }
+
+    let cutoff = sweep_started.checked_sub(Duration::from_secs(5));
+    if let Ok(entries) = fs::read_dir(CoverPaths::cover_dir()) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() && CoverPaths::is_managed_cover_file(&p) && !referenced.contains(&p) {
+                let old_enough = fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .is_none_or(|mtime| cutoff.is_none_or(|c| mtime < c));
+                if (explicitly_replaced.contains(&p) || old_enough) && fs::remove_file(&p).is_ok() {
+                    result.removed_files += 1;
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,35 +936,309 @@ mod tests {
     }
 
     #[test]
-    fn shrink_oversized_full_covers_rewrites_only_big_fulls() {
-        let dir = std::env::temp_dir().join(format!("retro-shrink-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let big = dir.join("big_full.jpg");
-        let small = dir.join("small_full.jpg");
-        let big_thumb = dir.join("big_thumb.jpg");
-        fs::write(&big, encode_capped_jpeg(&blank(2000, 1500), u32::MAX, 90).unwrap()).unwrap();
-        fs::write(&small, encode_capped_jpeg(&blank(600, 600), u32::MAX, 90).unwrap()).unwrap();
-        fs::write(&big_thumb, encode_capped_jpeg(&blank(2000, 2000), u32::MAX, 90).unwrap()).unwrap();
-        let small_before = fs::read(&small).unwrap();
-
-        let changed = shrink_oversized_full_covers(&dir, MAX_FULL_COVER_EDGE);
-
-        assert_eq!(changed, vec![big.clone()]);
-        assert_eq!(dims_of(&fs::read(&big).unwrap()), (720, 540));
-        assert_eq!(fs::read(&small).unwrap(), small_before);
-        assert_eq!(dims_of(&fs::read(&big_thumb).unwrap()), (2000, 2000));
-        assert!(shrink_oversized_full_covers(&dir, MAX_FULL_COVER_EDGE).is_empty());
-        let leftovers = fs::read_dir(&dir).unwrap().count();
-        assert_eq!(leftovers, 3);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn capped_jpeg_small_unchanged() {
         let out = encode_capped_jpeg(&blank(700, 500), MAX_FULL_COVER_EDGE, 90).unwrap();
         assert_eq!(dims_of(&out), (700, 500));
         let out = encode_capped_jpeg(&blank(500, 700), MAX_FULL_COVER_EDGE, 90).unwrap();
         assert_eq!(dims_of(&out), (500, 700));
+    }
+
+    #[test]
+    fn sha256_matches_nist_vectors() {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let boundary_vectors: &[(usize, &str)] = &[
+            (55, "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"),
+            (56, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"),
+            (63, "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34"),
+            (64, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"),
+            (65, "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0"),
+            (128, "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e"),
+        ];
+        for &(len, expected) in boundary_vectors {
+            assert_eq!(hex(&sha256(&vec![b'a'; len])), expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn save_cover_bytes_deduplicates_caps_and_preserves_formats() {
+        let dir = std::env::temp_dir().join(format!("retro-cover-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::paths::with_test_app_dir(&dir, || {
+            let small_jpg = encode_capped_jpeg(&blank(500, 400), u32::MAX, 88).unwrap();
+            let p1 = save_cover_bytes(&small_jpg).unwrap();
+            let p2 = save_cover_bytes(&small_jpg).unwrap();
+            assert_eq!(p1, p2);
+            assert!(CoverPaths::is_content_cover_file(&p1));
+            assert_eq!(p1.extension().and_then(|e| e.to_str()), Some("jpg"));
+            assert_eq!(fs::read(&p1).unwrap(), small_jpg);
+
+            let mut small_png = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(image::RgbaImage::new(320, 240))
+                .write_to(&mut small_png, ImageFormat::Png)
+                .unwrap();
+            let png_bytes = small_png.into_inner();
+            let p_png = save_cover_bytes(&png_bytes).unwrap();
+            assert_eq!(p_png.extension().and_then(|e| e.to_str()), Some("png"));
+            assert_eq!(fs::read(&p_png).unwrap(), png_bytes);
+
+            let mut small_webp = Cursor::new(Vec::new());
+            blank(200, 200)
+                .write_to(&mut small_webp, ImageFormat::WebP)
+                .unwrap();
+            let webp_bytes = small_webp.into_inner();
+            let p_webp = save_cover_bytes(&webp_bytes).unwrap();
+            assert_eq!(p_webp.extension().and_then(|e| e.to_str()), Some("webp"));
+            assert_eq!(fs::read(&p_webp).unwrap(), webp_bytes);
+
+            let big_jpg = encode_capped_jpeg(&blank(2400, 1200), u32::MAX, 90).unwrap();
+            let p_big = save_cover_bytes(&big_jpg).unwrap();
+            assert_eq!(dims_of(&fs::read(&p_big).unwrap()), (720, 360));
+
+            let count = fs::read_dir(CoverPaths::cover_dir()).unwrap().count();
+            assert_eq!(count, 4);
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_unreferenced_covers_respects_album_and_playlist_refs() {
+        let dir = std::env::temp_dir().join(format!("retro-cover-refcount-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::paths::with_test_app_dir(&dir, || {
+            let img_a = encode_capped_jpeg(&blank(400, 400), u32::MAX, 88).unwrap();
+            let mut img_b_buf = image::RgbImage::new(400, 400);
+            img_b_buf.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+            let img_b = encode_capped_jpeg(&DynamicImage::ImageRgb8(img_b_buf), u32::MAX, 88).unwrap();
+            let shared_path = save_cover_bytes(&img_a).unwrap();
+            let orphan_path = save_cover_bytes(&img_b).unwrap();
+            let shared_url = CoverPaths::to_file_url(&shared_path);
+
+            let mut lib = LibraryMap::new();
+            lib.insert(
+                "Album 1".to_owned(),
+                crate::library::AlbumDto {
+                    cover_art: Some(shared_url.clone()),
+                    cover_art_full: Some(shared_url.clone()),
+                    ..Default::default()
+                },
+            );
+            let mut cols = CollectionsData::default();
+            cols.playlists.push(crate::collections::PlaylistData {
+                id: 1,
+                name: "Favs".to_owned(),
+                cover_art: Some(shared_url.clone()),
+                ..Default::default()
+            });
+
+            delete_unreferenced_covers(&[shared_path.clone(), orphan_path.clone()], &lib, &cols);
+            assert!(shared_path.exists());
+            assert!(!orphan_path.exists());
+
+            lib.shift_remove("Album 1");
+            delete_unreferenced_covers(std::slice::from_ref(&shared_path), &lib, &cols);
+            assert!(shared_path.exists(), "playlist reference must keep shared cover alive");
+
+            cols.playlists.clear();
+            delete_unreferenced_covers(std::slice::from_ref(&shared_path), &lib, &cols);
+            assert!(!shared_path.exists(), "cover must be deleted once all refs are gone");
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deduplicate_and_sweep_migrates_legacy_pairs_and_keeps_playlists() {
+        let dir = std::env::temp_dir().join(format!("retro-cover-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::paths::with_test_app_dir(&dir, || {
+            let cover_dir = CoverPaths::cover_dir();
+            fs::create_dir_all(&cover_dir).unwrap();
+
+            let shared_img = encode_capped_jpeg(&blank(1000, 1000), u32::MAX, 90).unwrap();
+            let legacy_a_thumb = CoverPaths::thumb_path("Album A");
+            let legacy_a_full = CoverPaths::full_path("Album A");
+            let legacy_b_thumb = CoverPaths::thumb_path("Album B");
+            let legacy_b_full = CoverPaths::full_path("Album B");
+            fs::write(&legacy_a_thumb, &shared_img).unwrap();
+            fs::write(&legacy_a_full, &shared_img).unwrap();
+            fs::write(&legacy_b_thumb, &shared_img).unwrap();
+            fs::write(&legacy_b_full, &shared_img).unwrap();
+
+            let mut pl_buf = image::RgbImage::new(300, 300);
+            pl_buf.put_pixel(10, 10, image::Rgb([10, 200, 30]));
+            let pl_img = encode_capped_jpeg(&DynamicImage::ImageRgb8(pl_buf), u32::MAX, 90).unwrap();
+            let pl_legacy_full = cover_dir.join("native_pl_1_999_full.jpg");
+            let pl_legacy_thumb = cover_dir.join("native_pl_1_999_thumb.jpg");
+            fs::write(&pl_legacy_full, &pl_img).unwrap();
+            fs::write(&pl_legacy_thumb, &pl_img).unwrap();
+
+            let orphan = cover_dir.join("deadbeef_full.jpg");
+            fs::write(&orphan, &shared_img).unwrap();
+            let old_file = OpenOptions::new().write(true).open(&orphan).unwrap();
+            old_file
+                .set_modified(SystemTime::now() - Duration::from_secs(60))
+                .unwrap();
+
+            let fresh_orphan = cover_dir.join("freshbeef_full.jpg");
+            fs::write(&fresh_orphan, &shared_img).unwrap();
+
+            let mut lib = LibraryMap::new();
+            lib.insert(
+                "Album A".to_owned(),
+                crate::library::AlbumDto {
+                    name: Some("Album A".to_owned()),
+                    cover_art: Some(CoverPaths::to_file_url(&legacy_a_thumb)),
+                    cover_art_full: Some(CoverPaths::to_file_url(&legacy_a_full)),
+                    ..Default::default()
+                },
+            );
+            lib.insert(
+                "Album B".to_owned(),
+                crate::library::AlbumDto {
+                    name: Some("Album B".to_owned()),
+                    cover_art: Some(CoverPaths::to_file_url(&legacy_b_thumb)),
+                    cover_art_full: Some(CoverPaths::to_file_url(&legacy_b_full)),
+                    ..Default::default()
+                },
+            );
+            LibraryStore::save_raw(&lib).unwrap();
+
+            let mut cols = CollectionsData::default();
+            cols.playlists.push(crate::collections::PlaylistData {
+                id: 1,
+                name: "PL".to_owned(),
+                cover_art: Some(CoverPaths::to_file_url(&pl_legacy_full)),
+                ..Default::default()
+            });
+            assert!(migrate_playlist_covers(&mut cols));
+            CollectionsStore::save(&cols);
+
+            let res = deduplicate_and_sweep_covers(Some(&cols), None).unwrap();
+            assert_eq!(res.migrated_albums, 2);
+            assert!(!legacy_a_thumb.exists());
+            assert!(!legacy_a_full.exists());
+            assert!(!legacy_b_thumb.exists());
+            assert!(!legacy_b_full.exists());
+            assert!(!orphan.exists(), "60s-old orphan must be swept");
+            assert!(fresh_orphan.exists(), "<5s orphan must be spared during grace window");
+
+            let updated_lib = LibraryStore::load_raw().unwrap();
+            let url_a = updated_lib["Album A"].cover_art.as_ref().unwrap();
+            let url_b = updated_lib["Album B"].cover_art.as_ref().unwrap();
+            assert_eq!(url_a, url_b, "identical covers must deduplicate to one URL");
+            assert_eq!(updated_lib["Album A"].cover_art_full.as_ref(), Some(url_a));
+            let dedup_path = CoverPaths::to_local_path(Some(url_a)).unwrap();
+            assert!(dedup_path.exists());
+            assert_eq!(dims_of(&fs::read(&dedup_path).unwrap()), (720, 720));
+
+            let pl_path = CoverPaths::to_local_path(cols.playlists[0].cover_art.as_deref()).unwrap();
+            assert!(pl_path.exists());
+            assert!(CoverPaths::is_content_cover_file(&pl_path));
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_cover_bytes_handles_exif_rotation_oversized_alpha_png_and_bmp() {
+        let dir = std::env::temp_dir().join(format!("retro-cover-formats-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::paths::with_test_app_dir(&dir, || {
+            // 1. Small JPEG with EXIF Orientation = 6 (Rotate90): 200x100 -> 100x200 with EXIF stripped.
+            let raw_jpg = encode_capped_jpeg(&blank(200, 100), u32::MAX, 88).unwrap();
+            assert_eq!(&raw_jpg[..2], &[0xFF, 0xD8]);
+            // Minimal TIFF IFD0 in APP1 with 1 SHORT entry: tag 0x0112 (Orientation) = 6.
+            let app1_payload: Vec<u8> = vec![
+                b'E', b'x', b'i', b'f', 0, 0, // Exif header
+                b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // TIFF little-endian, IFD0 @ 8
+                0x01, 0x00, // 1 entry
+                0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, // Orientation=6
+                0x00, 0x00, 0x00, 0x00, // next IFD = 0
+            ];
+            let seg_len = (app1_payload.len() + 2) as u16;
+            let mut exif_jpg = Vec::with_capacity(raw_jpg.len() + app1_payload.len() + 4);
+            exif_jpg.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE1]);
+            exif_jpg.extend_from_slice(&seg_len.to_be_bytes());
+            exif_jpg.extend_from_slice(&app1_payload);
+            exif_jpg.extend_from_slice(&raw_jpg[2..]);
+
+            let exif_out = save_cover_bytes(&exif_jpg).unwrap();
+            let exif_bytes = fs::read(&exif_out).unwrap();
+            assert_eq!(dims_of(&exif_bytes), (100, 200));
+            let orient = ImageReader::new(Cursor::new(&exif_bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap()
+                .orientation()
+                .unwrap_or(Orientation::NoTransforms);
+            assert_eq!(orient, Orientation::NoTransforms);
+
+            // 2. Oversized RGBA PNG stays PNG with alpha and is capped at 720px.
+            let mut rgba = image::RgbaImage::new(1600, 800);
+            rgba.put_pixel(10, 10, image::Rgba([20, 40, 60, 128]));
+            let mut png_cur = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut png_cur, ImageFormat::Png)
+                .unwrap();
+            let png_out = save_cover_bytes(&png_cur.into_inner()).unwrap();
+            assert_eq!(png_out.extension().and_then(|e| e.to_str()), Some("png"));
+            let decoded_png = ImageReader::new(Cursor::new(fs::read(&png_out).unwrap()))
+                .with_guessed_format()
+                .unwrap()
+                .decode()
+                .unwrap();
+            assert_eq!((decoded_png.width(), decoded_png.height()), (720, 360));
+            assert!(decoded_png.color().has_alpha());
+
+            // 3. BMP input converts cleanly to normalized JPEG.
+            let mut bmp_cur = Cursor::new(Vec::new());
+            blank(300, 200)
+                .write_to(&mut bmp_cur, ImageFormat::Bmp)
+                .unwrap();
+            let bmp_out = save_cover_bytes(&bmp_cur.into_inner()).unwrap();
+            assert_eq!(bmp_out.extension().and_then(|e| e.to_str()), Some("jpg"));
+            assert_eq!(dims_of(&fs::read(&bmp_out).unwrap()), (300, 200));
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_playlist_covers_ignores_paths_outside_cover_dir() {
+        let dir = std::env::temp_dir().join(format!("retro-pl-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::paths::with_test_app_dir(&dir, || {
+            let outside_dir = dir.join("external");
+            fs::create_dir_all(&outside_dir).unwrap();
+            let outside_img = outside_dir.join("custom.jpg");
+            let jpg = encode_capped_jpeg(&blank(240, 240), u32::MAX, 88).unwrap();
+            fs::write(&outside_img, &jpg).unwrap();
+            let outside_url = CoverPaths::to_file_url(&outside_img);
+
+            let mut cols = CollectionsData::default();
+            cols.playlists.push(crate::collections::PlaylistData {
+                id: 7,
+                name: "External".to_owned(),
+                cover_art: Some(outside_url.clone()),
+                ..Default::default()
+            });
+
+            assert!(!migrate_playlist_covers(&mut cols));
+            assert_eq!(cols.playlists[0].cover_art.as_deref(), Some(outside_url.as_str()));
+            assert!(outside_img.exists());
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }
