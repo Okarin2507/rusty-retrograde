@@ -15,7 +15,8 @@ pub const MALLOC_ARENAS: i32 = 2;
 /// Call it at the very start of `main`, before any other thread exists. It does nothing on
 /// non-glibc targets (musl has a single allocator lock and no `M_ARENA_MAX`).
 pub fn limit_malloc_arenas() -> bool {
-    let user_tunable = std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("malloc.arena_max"));
+    let user_tunable =
+        std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("malloc.arena_max"));
     if user_tunable || std::env::var_os("MALLOC_ARENA_MAX").is_some() {
         return false;
     }

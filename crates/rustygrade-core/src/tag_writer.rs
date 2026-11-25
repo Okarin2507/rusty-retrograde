@@ -40,14 +40,33 @@ impl TagEdit {
 
 pub struct TagWriter;
 
+fn load_front_cover(path: &Path) -> Result<Picture, TagWriteError> {
+    let mut file = File::open(path)?;
+    let mut picture =
+        Picture::from_reader(&mut file).map_err(|e| TagWriteError::Lofty(e.to_string()))?;
+    picture.set_pic_type(PictureType::CoverFront);
+    picture.set_description(Some("Cover".to_owned()));
+    Ok(picture)
+}
+
 impl TagWriter {
     /// Writes `edit` to every path in `paths`, returning `(written_count, failures)`
     /// without stopping on individual file errors.
     pub fn write_batch(paths: &[PathBuf], edit: &TagEdit) -> (usize, Vec<(PathBuf, String)>) {
+        let preloaded = match &edit.cover_image {
+            Some(p) => match load_front_cover(p) {
+                Ok(pic) => Some(pic),
+                Err(e) => {
+                    let msg = e.to_string();
+                    return (0, paths.iter().map(|t| (t.clone(), msg.clone())).collect());
+                }
+            },
+            None => None,
+        };
         let mut ok = 0usize;
         let mut errs = Vec::new();
         for p in paths {
-            match Self::write(p, edit) {
+            match Self::write_with_cover(p, edit, preloaded.as_ref()) {
                 Ok(()) => ok += 1,
                 Err(e) => errs.push((p.clone(), e.to_string())),
             }
@@ -56,6 +75,19 @@ impl TagWriter {
     }
 
     pub fn write(path: &Path, edit: &TagEdit) -> Result<(), TagWriteError> {
+        let cover = edit
+            .cover_image
+            .as_deref()
+            .map(load_front_cover)
+            .transpose()?;
+        Self::write_with_cover(path, edit, cover.as_ref())
+    }
+
+    fn write_with_cover(
+        path: &Path,
+        edit: &TagEdit,
+        cover: Option<&Picture>,
+    ) -> Result<(), TagWriteError> {
         let mut tagged = Probe::open(path)
             .map_err(|e| TagWriteError::Lofty(e.to_string()))?
             .read()
@@ -122,16 +154,11 @@ impl TagWriter {
                 tag.set_disk(disc);
             }
         }
-        if let Some(image_path) = &edit.cover_image {
-            let mut file = File::open(image_path)?;
-            let mut picture =
-                Picture::from_reader(&mut file).map_err(|e| TagWriteError::Lofty(e.to_string()))?;
-            picture.set_pic_type(PictureType::CoverFront);
-            picture.set_description(Some("Cover".to_owned()));
+        if let Some(picture) = cover {
             while !tag.pictures().is_empty() {
                 tag.remove_picture(0);
             }
-            tag.push_picture(picture);
+            tag.push_picture(picture.clone());
         } else if edit.remove_cover {
             while !tag.pictures().is_empty() {
                 tag.remove_picture(0);
@@ -148,72 +175,48 @@ impl TagWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn minimal_flac_bytes() -> Vec<u8> {
-        let mut v = Vec::with_capacity(42);
-        v.extend_from_slice(b"fLaC");
-        v.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // last block = STREAMINFO (34 bytes)
-        v.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]); // min/max block 4096
-        v.extend_from_slice(&[0x00; 6]); // min/max frame size unknown
-        // 44100 Hz (0x0AC44), 2 ch (1), 16 bps (15), 44100 samples
-        v.extend_from_slice(&[0x0A, 0xC4, 0x42, 0xF0, 0x00, 0x00, 0xAC, 0x44]);
-        v.extend_from_slice(&[0x00; 16]); // MD5
-        v
-    }
+    use crate::test_util::{TempDir, minimal_flac_bytes};
 
     #[test]
     fn write_batch_preserves_untouched_fields_and_reports_errors() {
-        let dir = std::env::temp_dir().join(format!(
-            "retro-tag-batch-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = TempDir::new("tag-batch");
         let a = dir.join("a.flac");
         let b = dir.join("b.flac");
         let missing = dir.join("missing.flac");
-        std::fs::write(&a, minimal_flac_bytes()).expect("write a");
-        std::fs::write(&b, minimal_flac_bytes()).expect("write b");
+        std::fs::write(&a, minimal_flac_bytes()).unwrap();
+        std::fs::write(&b, minimal_flac_bytes()).unwrap();
 
-        let seed_a = TagEdit {
-            title: Some("Track One".into()),
-            artist: Some("Artist A".into()),
-            album: Some("Old Album".into()),
-            year: Some(2020),
-            ..Default::default()
-        };
-        let seed_b = TagEdit {
-            title: Some("Track Two".into()),
-            artist: Some("Artist B".into()),
-            album: Some("Old Album".into()),
-            year: Some(2020),
-            ..Default::default()
-        };
-        TagWriter::write(&a, &seed_a).expect("seed a");
-        TagWriter::write(&b, &seed_b).expect("seed b");
+        for (p, title, artist) in [(&a, "Track One", "Artist A"), (&b, "Track Two", "Artist B")] {
+            TagWriter::write(
+                p,
+                &TagEdit {
+                    title: Some(title.into()),
+                    artist: Some(artist.into()),
+                    album: Some("Old Album".into()),
+                    year: Some(2020),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
 
-        // Album-level edit: changes only album + year; track titles & artists stay intact.
         let batch = TagEdit {
             album: Some("New Album".into()),
             year: Some(2024),
             ..Default::default()
         };
-        let (written, errs) = TagWriter::write_batch(&[a.clone(), missing.clone(), b.clone()], &batch);
+        let (written, errs) =
+            TagWriter::write_batch(&[a.clone(), missing.clone(), b.clone()], &batch);
         assert_eq!(written, 2);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].0, missing);
 
-        let ta = Probe::open(&a).unwrap().read().unwrap();
-        let tb = Probe::open(&b).unwrap().read().unwrap();
-        let p_a = ta.primary_tag().unwrap();
-        let p_b = tb.primary_tag().unwrap();
-        assert_eq!(p_a.title().as_deref(), Some("Track One"));
-        assert_eq!(p_a.artist().as_deref(), Some("Artist A"));
-        assert_eq!(p_a.album().as_deref(), Some("New Album"));
-        assert_eq!(p_b.title().as_deref(), Some("Track Two"));
-        assert_eq!(p_b.artist().as_deref(), Some("Artist B"));
-        assert_eq!(p_b.album().as_deref(), Some("New Album"));
-        let _ = std::fs::remove_dir_all(&dir);
+        for (p, title, artist) in [(&a, "Track One", "Artist A"), (&b, "Track Two", "Artist B")] {
+            let tf = Probe::open(p).unwrap().read().unwrap();
+            let tag = tf.primary_tag().unwrap();
+            assert_eq!(tag.title().as_deref(), Some(title));
+            assert_eq!(tag.artist().as_deref(), Some(artist));
+            assert_eq!(tag.album().as_deref(), Some("New Album"));
+        }
     }
 }

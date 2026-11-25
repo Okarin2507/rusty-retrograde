@@ -6,7 +6,7 @@ pub mod pipewire_bridge;
 
 pub use alsa_direct::{
     AlsaDirect, AlsaHwParams, AudioFormat, DIRECT_PREFIX, DirectDevice, evaluate_bit_perfect,
-    parse_hw_params, status_is_closed,
+    parse_hw_params,
 };
 pub use alsa_mixer::{AlsaMixer, CoalescedHwWriter, db_to_level, level_to_db};
 pub use libmpv::{LibMpvClient, LibMpvError, MpvEventMsg, MpvValue};

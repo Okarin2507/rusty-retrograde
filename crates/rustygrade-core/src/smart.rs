@@ -1,9 +1,5 @@
-use std::collections::HashSet;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::collections::{SmartPlaylistData, SmartRule};
-use crate::models::{Album, Track};
+use crate::models::{Album, Track, normalize_codec};
 use crate::stats::PlayStat;
 
 #[derive(Debug, Clone)]
@@ -131,10 +127,7 @@ impl SmartPlaylists {
     }
 
     pub fn examples() -> Vec<SmartPlaylistData> {
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(1);
+        let id = crate::now_ms().max(1);
         vec![
             SmartPlaylistData {
                 id,
@@ -190,6 +183,39 @@ impl SmartPlaylists {
         ]
     }
 
+    /// Counts matching tracks without sorting or cloning `Track` values.
+    pub fn count<'a, FStats, FLiked>(
+        playlist: &SmartPlaylistData,
+        library: impl IntoIterator<Item = (&'a Track, &'a Album)>,
+        stats: FStats,
+        liked: FLiked,
+        now_ms: i64,
+    ) -> usize
+    where
+        FStats: Fn(&str) -> Option<&'a PlayStat>,
+        FLiked: Fn(&str) -> bool,
+    {
+        let compiled = compile_rules(&playlist.rules);
+        let mut total = 0usize;
+        for (track, album) in library {
+            if matches_compiled(
+                &compiled,
+                playlist.match_all,
+                track,
+                album,
+                &stats,
+                &liked,
+                now_ms,
+            ) {
+                total += 1;
+                if playlist.limit > 0 && total >= playlist.limit {
+                    return playlist.limit;
+                }
+            }
+        }
+        total
+    }
+
     /// Evaluates a smart playlist over `(Track, Album)` entries at `now_ms` (Unix milliseconds).
     pub fn evaluate<'a, FStats, FLiked>(
         playlist: &SmartPlaylistData,
@@ -202,55 +228,35 @@ impl SmartPlaylists {
         FStats: Fn(&str) -> Option<&'a PlayStat>,
         FLiked: Fn(&str) -> bool,
     {
-        let rules: Vec<&SmartRule> = playlist
-            .rules
-            .iter()
-            .filter(|r| !Self::needs_value(&r.op) || !r.value.trim().is_empty())
+        let compiled = compile_rules(&playlist.rules);
+        let mut hits: Vec<(&'a Track, &'a Album)> = library
+            .into_iter()
+            .filter(|(track, album)| {
+                matches_compiled(
+                    &compiled,
+                    playlist.match_all,
+                    track,
+                    album,
+                    &stats,
+                    &liked,
+                    now_ms,
+                )
+            })
             .collect();
-
-        let mut hits: Vec<(&'a Track, &'a Album)> = Vec::new();
-        for (track, album) in library {
-            if rules.is_empty() {
-                hits.push((track, album));
-                continue;
-            }
-            let ok = if playlist.match_all {
-                rules
-                    .iter()
-                    .all(|r| matches_rule(r, track, album, &stats, &liked, now_ms))
-            } else {
-                rules
-                    .iter()
-                    .any(|r| matches_rule(r, track, album, &stats, &liked, now_ms))
-            };
-            if ok {
-                hits.push((track, album));
-            }
-        }
 
         match playlist.sort.as_str() {
             "added_desc" => hits.sort_by_key(|a| std::cmp::Reverse(a.1.added_at)),
-            "plays_desc" => hits.sort_by(|a, b| {
-                let sa = stats(&a.0.id);
-                let sb = stats(&b.0.id);
-                let ca = sa.map(|s| s.count).unwrap_or(0);
-                let cb = sb.map(|s| s.count).unwrap_or(0);
-                cb.cmp(&ca)
-                    .then_with(|| sb.map(|s| s.last).unwrap_or(0).cmp(&sa.map(|s| s.last).unwrap_or(0)))
+            "plays_desc" => hits.sort_by_cached_key(|(t, _)| {
+                let s = stats(&t.id);
+                std::cmp::Reverse((s.map_or(0, |st| st.count), s.map_or(0, |st| st.last)))
             }),
-            "played_desc" => hits.sort_by(|a, b| {
-                let la = stats(&a.0.id).map(|s| s.last).unwrap_or(0);
-                let lb = stats(&b.0.id).map(|s| s.last).unwrap_or(0);
-                lb.cmp(&la)
+            "played_desc" => hits.sort_by_cached_key(|(t, _)| {
+                std::cmp::Reverse(stats(&t.id).map_or(0, |st| st.last))
             }),
-            "title" => hits.sort_by(|a, b| {
-                a.0.title
-                    .to_lowercase()
-                    .cmp(&b.0.title.to_lowercase())
-            }),
+            "title" => hits.sort_by_cached_key(|(t, _)| t.title.to_lowercase()),
             "random" => {
                 let day = now_ms.div_euclid(86_400_000) as u64;
-                hits.sort_by_key(|(t, _)| daily_random_key(&t.id, playlist.id as u64, day));
+                hits.sort_by_cached_key(|(t, _)| daily_random_key(&t.id, playlist.id as u64, day));
             }
             _ => {}
         }
@@ -262,46 +268,47 @@ impl SmartPlaylists {
             iter.collect()
         }
     }
-
-    pub fn evaluate_albums<'a, FStats>(
-        playlist: &SmartPlaylistData,
-        albums: &'a [Album],
-        stats: FStats,
-        liked_ids: &HashSet<String>,
-        now_ms: i64,
-    ) -> Vec<Track>
-    where
-        FStats: Fn(&str) -> Option<&'a PlayStat>,
-    {
-        let entries = albums
-            .iter()
-            .flat_map(|a| a.tracks.iter().map(move |t| (t, a)));
-        Self::evaluate(
-            playlist,
-            entries,
-            stats,
-            |id| liked_ids.contains(id),
-            now_ms,
-        )
-    }
 }
 
-fn daily_random_key(track_id: &str, playlist_id: u64, day: u64) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ playlist_id ^ day.rotate_left(17);
-    for b in track_id.to_lowercase().bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    // SplitMix64 finalizer so consecutive paths spread evenly
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^ (h >> 31)
+struct CompiledRule<'a> {
+    field: &'a str,
+    op: &'a str,
+    lower_val: String,
+    codec_val: String,
+    num_val: Option<f64>,
 }
 
-fn matches_rule<'a, FStats, FLiked>(
-    r: &SmartRule,
+fn compile_rules(rules: &[SmartRule]) -> Vec<CompiledRule<'_>> {
+    rules
+        .iter()
+        .filter(|r| !SmartPlaylists::needs_value(&r.op) || !r.value.trim().is_empty())
+        .map(|r| {
+            let trimmed = r.value.trim();
+            let lower_val = trimmed.to_lowercase();
+            let codec_val = if r.field == "codec" {
+                normalize_codec(trimmed, "")
+            } else {
+                String::new()
+            };
+            let num_val = trimmed
+                .replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite());
+            CompiledRule {
+                field: &r.field,
+                op: &r.op,
+                lower_val,
+                codec_val,
+                num_val,
+            }
+        })
+        .collect()
+}
+
+fn matches_compiled<'a, FStats, FLiked>(
+    rules: &[CompiledRule<'_>],
+    match_all: bool,
     t: &Track,
     a: &Album,
     stats: &FStats,
@@ -312,54 +319,99 @@ where
     FStats: Fn(&str) -> Option<&'a PlayStat>,
     FLiked: Fn(&str) -> bool,
 {
-    let v = r.value.trim();
-    match r.field.as_str() {
-        "title" => cmp_text(&t.title, &r.op, v),
+    if rules.is_empty() {
+        return true;
+    }
+    if match_all {
+        rules
+            .iter()
+            .all(|r| matches_rule(r, t, a, stats, liked, now_ms))
+    } else {
+        rules
+            .iter()
+            .any(|r| matches_rule(r, t, a, stats, liked, now_ms))
+    }
+}
+
+fn daily_random_key(track_id: &str, playlist_id: u64, day: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ playlist_id ^ day.rotate_left(17);
+    for b in track_id.to_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
+fn matches_rule<'a, FStats, FLiked>(
+    r: &CompiledRule<'_>,
+    t: &Track,
+    a: &Album,
+    stats: &FStats,
+    liked: &FLiked,
+    now_ms: i64,
+) -> bool
+where
+    FStats: Fn(&str) -> Option<&'a PlayStat>,
+    FLiked: Fn(&str) -> bool,
+{
+    match r.field {
+        "title" => cmp_text(&t.title, r.op, &r.lower_val),
         "artist" => {
             if r.op == "not_contains" {
-                cmp_text(&t.artist, &r.op, v) && cmp_text(&a.artist, &r.op, v)
+                cmp_text(&t.artist, r.op, &r.lower_val) && cmp_text(&a.artist, r.op, &r.lower_val)
             } else {
-                cmp_text(&t.artist, &r.op, v) || cmp_text(&a.artist, &r.op, v)
+                cmp_text(&t.artist, r.op, &r.lower_val) || cmp_text(&a.artist, r.op, &r.lower_val)
             }
         }
-        "album" => cmp_text(&a.name, &r.op, v),
+        "album" => cmp_text(&a.name, r.op, &r.lower_val),
         "codec" => {
-            let same = Codecs::short(&t.codec, &t.file_path)
-                .eq_ignore_ascii_case(&Codecs::short(v, ""));
-            if r.op == "is_not" { !same } else { same }
+            let same = t.short_codec().eq_ignore_ascii_case(&r.codec_val);
+            match r.op {
+                "is" => same,
+                "is_not" => !same,
+                _ => false,
+            }
         }
-        "bits" => cmp_number(t.bits_per_sample as f64, &r.op, v, 0.001),
-        "rate" => cmp_number(t.sample_rate as f64 / 1000.0, &r.op, v, 0.05),
-        "year" => cmp_number(a.year as f64, &r.op, v, 0.001),
-        "duration" => cmp_number(t.duration / 60.0, &r.op, v, 0.001),
-        "plays" => cmp_number(stats(&t.id).map(|s| s.count).unwrap_or(0) as f64, &r.op, v, 0.001),
+        "bits" => cmp_number(t.bits_per_sample as f64, r.op, r.num_val, 0.001),
+        "rate" => cmp_number(t.sample_rate as f64 / 1000.0, r.op, r.num_val, 0.05),
+        "year" => cmp_number(a.year as f64, r.op, r.num_val, 0.001),
+        "duration" => cmp_number(t.duration / 60.0, r.op, r.num_val, 0.001),
+        "plays" => cmp_number(
+            stats(&t.id).map(|s| s.count).unwrap_or(0) as f64,
+            r.op,
+            r.num_val,
+            0.001,
+        ),
         "played" => {
             let last = stats(&t.id).map(|s| s.last).unwrap_or(0);
             if r.op == "never" {
                 last == 0
             } else {
-                within(last, now_ms, &r.op, v)
+                within(last, now_ms, r.op, r.num_val)
             }
         }
-        "added" => within(a.added_at, now_ms, &r.op, v),
+        "added" => within(a.added_at, now_ms, r.op, r.num_val),
         "liked" => liked(&t.id) == (r.op == "yes"),
         _ => false,
     }
 }
 
-fn cmp_text(field: &str, op: &str, v: &str) -> bool {
+fn cmp_text(field: &str, op: &str, needle: &str) -> bool {
     let f = field.to_lowercase();
-    let needle = v.to_lowercase();
     match op {
-        "contains" => f.contains(&needle),
-        "not_contains" => !f.contains(&needle),
+        "contains" => f.contains(needle),
+        "not_contains" => !f.contains(needle),
         "is" => f.trim() == needle,
         _ => false,
     }
 }
 
-fn cmp_number(field: f64, op: &str, v: &str, tolerance: f64) -> bool {
-    let Ok(n) = v.replace(',', ".").parse::<f64>() else {
+fn cmp_number(field: f64, op: &str, val: Option<f64>, tolerance: f64) -> bool {
+    let Some(n) = val else {
         return false;
     };
     match op {
@@ -370,67 +422,15 @@ fn cmp_number(field: f64, op: &str, v: &str, tolerance: f64) -> bool {
     }
 }
 
-fn within(when_ms: i64, now_ms: i64, op: &str, v: &str) -> bool {
-    let Ok(days) = v.replace(',', ".").parse::<f64>() else {
+fn within(when_ms: i64, now_ms: i64, op: &str, days: Option<f64>) -> bool {
+    let Some(days) = days else {
         return false;
     };
     let inside = when_ms > 0 && ((now_ms - when_ms) as f64) <= days * 86_400_000.0;
-    if op == "within" { inside } else { !inside }
-}
-
-/// Short format names (`FLAC`, `MP3`, `AAC`...) from codec descriptions or file extensions.
-pub struct Codecs;
-
-impl Codecs {
-    pub fn short(codec: &str, file_path: &str) -> String {
-        if codec.is_empty() {
-            let ext = Path::new(file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            return if ext.is_empty() {
-                "AUDIO".to_owned()
-            } else {
-                ext.to_ascii_uppercase()
-            };
-        }
-        let c = codec.to_ascii_uppercase();
-        if c.contains("MPEG") || c == "MP3" {
-            return "MP3".to_owned();
-        }
-        if c.contains("VORBIS") || c == "OGG" {
-            return "OGG".to_owned();
-        }
-        if c.contains("PCM") || c == "WAV" {
-            return "WAV".to_owned();
-        }
-        if c.contains("WINDOWS MEDIA") {
-            return "WMA".to_owned();
-        }
-        if c.contains("ALAC") || c.contains("APPLE LOSSLESS") {
-            return "ALAC".to_owned();
-        }
-        if c.contains("AAC") {
-            return "AAC".to_owned();
-        }
-        if c.contains("OPUS") {
-            return "OPUS".to_owned();
-        }
-        if c.contains("FLAC") {
-            return "FLAC".to_owned();
-        }
-        let ext = Path::new(file_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if !ext.is_empty() {
-            return ext.to_ascii_uppercase();
-        }
-        if c.len() > 8 {
-            c[..8].trim().to_owned()
-        } else {
-            c
-        }
+    match op {
+        "within" => inside,
+        "not_within" => !inside,
+        _ => false,
     }
 }
 
@@ -438,14 +438,14 @@ impl Codecs {
 mod tests {
     use super::*;
 
-    fn sample_track(id: &str, bits: i32, rate: i32, codec: &str) -> (Track, Album) {
+    fn sample_track(id: &str, bits: i32, rate: i32, codec: &str, path: &str) -> (Track, Album) {
         let track = Track {
             id: id.to_owned(),
             title: format!("Track {id}"),
             artist: "Ado".to_owned(),
             album: "Kyogen".to_owned(),
             duration: 210.0,
-            file_path: format!("/music/{id}.flac"),
+            file_path: path.to_owned(),
             track_number: 1,
             disc_number: 1,
             codec: codec.to_owned(),
@@ -469,8 +469,9 @@ mod tests {
 
     #[test]
     fn evaluates_hires_and_codec_rules() {
-        let (t1, a1) = sample_track("1", 16, 44100, "FLAC");
-        let (t2, a2) = sample_track("2", 24, 96000, "FLAC");
+        let (t1, a1) = sample_track("1", 16, 44100, "FLAC", "/music/1.flac");
+        let (t2, a2) = sample_track("2", 24, 96000, "FLAC", "/music/2.flac");
+        let (t3, a3) = sample_track("3", 16, 44100, "MPEG-4 AAC", "/music/3.m4a");
         let pl = SmartPlaylistData {
             id: 42,
             name: "Hi-Res".to_owned(),
@@ -496,12 +497,49 @@ mod tests {
         };
         let hits = SmartPlaylists::evaluate(
             &pl,
-            [(&t1, &a1), (&t2, &a2)],
+            [(&t1, &a1), (&t2, &a2), (&t3, &a3)],
             |_| None,
             |_| false,
             1_700_100_000_000,
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "2");
+        assert_eq!(
+            SmartPlaylists::count(&pl, [(&t1, &a1), (&t2, &a2)], |_| None, |_| false, 0),
+            1
+        );
+
+        // Non-ASCII codec rule + MPEG-4 AAC classification must not panic or misclassify as MP3.
+        let aac_pl = SmartPlaylistData {
+            rules: vec![SmartRule {
+                field: "codec".to_owned(),
+                op: "is".to_owned(),
+                value: "aac".to_owned(),
+            }],
+            ..SmartPlaylistData::default()
+        };
+        assert_eq!(
+            SmartPlaylists::count(&aac_pl, [(&t3, &a3)], |_| None, |_| false, 0),
+            1
+        );
+        let non_ascii_pl = SmartPlaylistData {
+            rules: vec![
+                SmartRule {
+                    field: "codec".to_owned(),
+                    op: "is".to_owned(),
+                    value: "日本語テスト".to_owned(),
+                },
+                SmartRule {
+                    field: "added".to_owned(),
+                    op: "not_within".to_owned(),
+                    value: "NaN".to_owned(),
+                },
+            ],
+            ..SmartPlaylistData::default()
+        };
+        assert_eq!(
+            SmartPlaylists::count(&non_ascii_pl, [(&t3, &a3)], |_| None, |_| false, 0),
+            0
+        );
     }
 }

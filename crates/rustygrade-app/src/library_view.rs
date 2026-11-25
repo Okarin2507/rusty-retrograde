@@ -79,7 +79,11 @@ pub fn fold(s: &str) -> String {
 /// The artist key an artist page is opened with.
 pub fn artist_key(name: &str) -> String {
     let trimmed = name.trim();
-    fold(if trimmed.is_empty() { "Unknown Artist" } else { trimmed })
+    fold(if trimmed.is_empty() {
+        "Unknown Artist"
+    } else {
+        trimmed
+    })
 }
 
 /// Last play time and total plays of an album's tracks.
@@ -107,7 +111,13 @@ pub fn sort_albums(albums: &[Album], sort: LibrarySort, stats: &PlayStats) -> Ve
         LibrarySort::ArtistAsc => idx.sort_by_cached_key(|&i| fold(&albums[i].artist)),
         LibrarySort::ArtistDesc => idx.sort_by_cached_key(|&i| Reverse(fold(&albums[i].artist))),
         LibrarySort::YearDesc => idx.sort_by_key(|&i| Reverse(albums[i].year)),
-        LibrarySort::YearAsc => idx.sort_by_key(|&i| albums[i].year),
+        LibrarySort::YearAsc => idx.sort_by_key(|&i| {
+            if albums[i].year > 0 {
+                albums[i].year
+            } else {
+                i32::MAX
+            }
+        }),
         // Albums never played keep their added order at the end
         LibrarySort::PlayedDesc => idx.sort_by_cached_key(|&i| {
             let (last, _) = album_plays(&albums[i], stats);
@@ -123,24 +133,51 @@ pub fn sort_albums(albums: &[Album], sort: LibrarySort, stats: &PlayStats) -> Ve
 
 /// The artists in the library sort (`SortedArtists` of the original): names alphabetically, dates by the
 /// artist's newest album.
-pub fn sort_artists(artists: &[ArtistSummary], sort: LibrarySort, stats: &PlayStats) -> Vec<usize> {
+pub fn sort_artists(
+    artists: &[ArtistSummary],
+    albums: &[Album],
+    sort: LibrarySort,
+    stats: &PlayStats,
+) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..artists.len()).collect();
+    fn artist_albums<'a>(
+        a: &'a ArtistSummary,
+        albums: &'a [Album],
+    ) -> impl Iterator<Item = &'a Album> {
+        a.album_indices.iter().filter_map(|&ai| albums.get(ai))
+    }
     let plays = |a: &ArtistSummary| {
-        a.albums.iter().map(|al| album_plays(al, stats)).fold((0i64, 0i64), |(l, c), (al, ac)| (l.max(al), c + ac))
+        artist_albums(a, albums)
+            .map(|al| album_plays(al, stats))
+            .fold((0i64, 0i64), |(l, c), (al, ac)| (l.max(al), c + ac))
     };
     match sort {
-        LibrarySort::NameAsc | LibrarySort::ArtistAsc => idx.sort_by_cached_key(|&i| fold(&artists[i].name)),
+        LibrarySort::NameAsc | LibrarySort::ArtistAsc => {
+            idx.sort_by_cached_key(|&i| fold(&artists[i].name))
+        }
         LibrarySort::NameDesc | LibrarySort::ArtistDesc => {
             idx.sort_by_cached_key(|&i| Reverse(fold(&artists[i].name)))
         }
-        LibrarySort::AddedAsc => {
-            idx.sort_by_key(|&i| artists[i].albums.iter().map(|a| a.added_at).min().unwrap_or(0))
-        }
-        LibrarySort::YearDesc => {
-            idx.sort_by_key(|&i| Reverse(artists[i].albums.iter().map(|a| a.year).max().unwrap_or(0)))
-        }
-        LibrarySort::YearAsc => idx.sort_by_key(|&i| {
-            artists[i].albums.iter().map(|a| a.year).filter(|y| *y > 0).min().unwrap_or(i32::MAX)
+        LibrarySort::AddedAsc => idx.sort_by_cached_key(|&i| {
+            artist_albums(&artists[i], albums)
+                .map(|a| a.added_at)
+                .min()
+                .unwrap_or(0)
+        }),
+        LibrarySort::YearDesc => idx.sort_by_cached_key(|&i| {
+            Reverse(
+                artist_albums(&artists[i], albums)
+                    .map(|a| a.year)
+                    .max()
+                    .unwrap_or(0),
+            )
+        }),
+        LibrarySort::YearAsc => idx.sort_by_cached_key(|&i| {
+            artist_albums(&artists[i], albums)
+                .map(|a| a.year)
+                .filter(|y| *y > 0)
+                .min()
+                .unwrap_or(i32::MAX)
         }),
         LibrarySort::PlayedDesc => {
             idx.sort_by_cached_key(|&i| (Reverse(plays(&artists[i]).0), fold(&artists[i].name)))
@@ -158,7 +195,7 @@ pub fn sort_artists(artists: &[ArtistSummary], sort: LibrarySort, stats: &PlaySt
 pub fn group_artists(albums: &[Album]) -> Vec<ArtistSummary> {
     let mut by_key: HashMap<String, usize> = HashMap::new();
     let mut artists: Vec<ArtistSummary> = Vec::new();
-    for album in albums {
+    for (album_idx, album) in albums.iter().enumerate() {
         let display_name = if album.artist.trim().is_empty() {
             "Unknown Artist".to_owned()
         } else {
@@ -167,7 +204,7 @@ pub fn group_artists(albums: &[Album]) -> Vec<ArtistSummary> {
         let i = *by_key.entry(fold(&display_name)).or_insert_with(|| {
             artists.push(ArtistSummary {
                 name: display_name,
-                albums: Vec::new(),
+                album_indices: Vec::new(),
                 track_count: 0,
                 newest_added_at: 0,
             });
@@ -176,12 +213,12 @@ pub fn group_artists(albums: &[Album]) -> Vec<ArtistSummary> {
         let entry = &mut artists[i];
         entry.track_count += album.tracks.len();
         entry.newest_added_at = entry.newest_added_at.max(album.added_at);
-        entry.albums.push(album.clone());
+        entry.album_indices.push(album_idx);
     }
     for artist in &mut artists {
         artist
-            .albums
-            .sort_by_key(|a| (Reverse(a.year), Reverse(a.added_at)));
+            .album_indices
+            .sort_by_key(|&i| (Reverse(albums[i].year), Reverse(albums[i].added_at)));
     }
     artists
 }
@@ -258,22 +295,39 @@ mod tests {
         ];
         let stats = PlayStats::default();
 
-        assert_eq!(sort_albums(&albums, LibrarySort::AddedDesc, &stats), vec![1, 2, 0]);
-        assert_eq!(sort_albums(&albums, LibrarySort::NameAsc, &stats), vec![1, 2, 0]);
-        assert_eq!(sort_albums(&albums, LibrarySort::NameDesc, &stats), vec![0, 2, 1]);
+        assert_eq!(
+            sort_albums(&albums, LibrarySort::AddedDesc, &stats),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            sort_albums(&albums, LibrarySort::NameAsc, &stats),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            sort_albums(&albums, LibrarySort::NameDesc, &stats),
+            vec![0, 2, 1]
+        );
         assert_eq!(search_albums(&albums, "jaz"), vec![2]);
 
         let artists = group_artists(&albums);
         assert_eq!(artists.len(), 2);
         assert_eq!(artists[0].name, "Ado");
+        assert_eq!(artists[0].album_indices, vec![0, 1]);
         assert_eq!(artists[0].track_count, 2);
         assert_eq!(artists[0].newest_added_at, 30);
         assert_eq!(search_artists(&artists, "miles"), vec![1]);
-        assert_eq!(sort_artists(&artists, LibrarySort::NameDesc, &stats), vec![1, 0]);
+        assert_eq!(
+            sort_artists(&artists, &albums, LibrarySort::NameDesc, &stats),
+            vec![1, 0]
+        );
+        assert_eq!(
+            sort_artists(&artists, &albums, LibrarySort::YearAsc, &stats),
+            vec![1, 0]
+        );
     }
 
     #[test]
-    fn ties_keep_load_order() {
+    fn ties_keep_load_order_and_year_zero_sorts_last() {
         let albums = vec![
             mk_album("C", "X", 2000, 5, "a"),
             mk_album("A", "Y", 2000, 5, "b"),
@@ -281,16 +335,37 @@ mod tests {
         ];
         let stats = PlayStats::default();
         for sort in LibrarySort::ALL {
-            if matches!(sort, LibrarySort::NameAsc | LibrarySort::NameDesc | LibrarySort::ArtistAsc | LibrarySort::ArtistDesc) {
+            if matches!(
+                sort,
+                LibrarySort::NameAsc
+                    | LibrarySort::NameDesc
+                    | LibrarySort::ArtistAsc
+                    | LibrarySort::ArtistDesc
+            ) {
                 continue;
             }
-            assert_eq!(sort_albums(&albums, sort, &stats), vec![0, 1, 2], "{sort:?}");
+            assert_eq!(
+                sort_albums(&albums, sort, &stats),
+                vec![0, 1, 2],
+                "{sort:?}"
+            );
         }
+        let with_zero = vec![
+            mk_album("Unk", "X", 0, 1, "a"),
+            mk_album("Known", "Y", 1995, 2, "b"),
+        ];
+        assert_eq!(
+            sort_albums(&with_zero, LibrarySort::YearAsc, &stats),
+            vec![1, 0]
+        );
     }
 
     #[test]
     fn unicode_case_folds_and_sort_keys_roundtrip() {
-        let albums = vec![mk_album("Élan", "Äther", 2001, 1, "x"), mk_album("b", "äther", 2002, 2, "y")];
+        let albums = vec![
+            mk_album("Élan", "Äther", 2001, 1, "x"),
+            mk_album("b", "äther", 2002, 2, "y"),
+        ];
         assert_eq!(group_artists(&albums).len(), 1);
         assert_eq!(search_albums(&albums, &fold("ÉLAN")), vec![0]);
         for s in LibrarySort::ALL {

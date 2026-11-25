@@ -44,7 +44,7 @@ impl LyricsDoc {
 }
 
 static STAMP_RX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]").unwrap());
+    LazyLock::new(|| Regex::new(r"^\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]").unwrap());
 static META_RX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\[(ar|ti|al|au|by|re|ve|length|id|#|offset)\s*:([^\]]*)\]\s*$").unwrap()
 });
@@ -63,9 +63,11 @@ impl LyricsLoader {
             return Some(doc);
         }
 
-        let probe = Probe::open(audio_path)
-            .ok()?
-            .options(ParseOptions::new().read_properties(false).read_cover_art(false));
+        let probe = Probe::open(audio_path).ok()?.options(
+            ParseOptions::new()
+                .read_properties(false)
+                .read_cover_art(false),
+        );
         let tagged = probe.read().ok()?;
         let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
         let text = tag.get_string(ItemKey::Lyrics)?;
@@ -80,8 +82,10 @@ impl LyricsLoader {
         let mut plain = Vec::new();
         let mut offset_secs = 0.0_f64;
 
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        for raw in normalized.split('\n') {
+        for raw in text
+            .split('\n')
+            .flat_map(|s| s.strip_suffix('\r').unwrap_or(s).split('\r'))
+        {
             let line = raw.trim();
             if let Some(meta) = META_RX.captures(line) {
                 if meta[1].eq_ignore_ascii_case("offset")
@@ -92,8 +96,22 @@ impl LyricsLoader {
                 continue;
             }
 
-            let stamps: Vec<_> = STAMP_RX.captures_iter(line).collect();
-            if stamps.is_empty() {
+            // Only consume contiguous leading timestamps so incidental `[1:23]` inside lyric
+            // text never strips preceding words.
+            let mut rest = line;
+            let mut times = Vec::new();
+            while let Some(cap) = STAMP_RX.captures(rest) {
+                let m = cap.get(0).unwrap();
+                if let Ok(min) = cap[1].parse::<i64>() {
+                    let sec_str = cap[2].replace(':', ".");
+                    if let Ok(sec) = sec_str.parse::<f64>() {
+                        times.push((min as f64) * 60.0 + sec);
+                    }
+                }
+                rest = rest[m.end()..].trim_start();
+            }
+
+            if times.is_empty() {
                 plain.push(LyricLine {
                     time: -1.0,
                     text: line.to_owned(),
@@ -101,20 +119,10 @@ impl LyricsLoader {
                 continue;
             }
 
-            let last_match = stamps.last().unwrap().get(0).unwrap();
-            let raw_body = &line[last_match.end()..];
-            let body = INLINE_WORD_RX.replace_all(raw_body, "").trim().to_owned();
-
-            for cap in &stamps {
-                let Ok(min) = cap[1].parse::<i64>() else {
-                    continue;
-                };
-                let sec_str = cap[2].replace(':', ".");
-                let Ok(sec) = sec_str.parse::<f64>() else {
-                    continue;
-                };
+            let body = INLINE_WORD_RX.replace_all(rest, "").trim().to_owned();
+            for time in times {
                 synced.push(LyricLine {
-                    time: (min as f64) * 60.0 + sec,
+                    time,
                     text: body.clone(),
                 });
             }
@@ -132,9 +140,11 @@ impl LyricsLoader {
             });
         }
 
-        while plain.first().is_some_and(|l| l.text.is_empty()) {
-            plain.remove(0);
-        }
+        let first_non_empty = plain
+            .iter()
+            .position(|l| !l.text.is_empty())
+            .unwrap_or(plain.len());
+        plain.drain(..first_non_empty);
         while plain.last().is_some_and(|l| l.text.is_empty()) {
             plain.pop();
         }
@@ -185,7 +195,7 @@ mod tests {
 [ti:Test]
 [offset:500]
 [00:01.00][00:10.50]<00:01.10>Hello <00:01.50>world
-[00:05.00]Second line
+[00:05.00]Second line [00:00.00] literal
 ";
         let doc = LyricsLoader::parse(lrc, "LRC").unwrap();
         assert!(doc.is_synced);
@@ -193,7 +203,7 @@ mod tests {
         assert!((doc.lines[0].time - 0.5).abs() < 1e-6);
         assert_eq!(doc.lines[0].text, "Hello world");
         assert!((doc.lines[1].time - 4.5).abs() < 1e-6);
-        assert_eq!(doc.lines[1].text, "Second line");
+        assert_eq!(doc.lines[1].text, "Second line [00:00.00] literal");
         assert!((doc.lines[2].time - 10.0).abs() < 1e-6);
         assert_eq!(doc.index_at(0.2), None);
         assert_eq!(doc.index_at(0.5), Some(0));

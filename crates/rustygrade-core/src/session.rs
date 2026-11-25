@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::json_store::save_atomic_locked;
 use crate::paths::CoverPaths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,7 +29,7 @@ impl Default for SessionState {
     }
 }
 
-static GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static GATE: Mutex<()> = Mutex::new(());
 
 pub struct SessionStore;
 
@@ -59,34 +60,20 @@ impl SessionStore {
     }
 
     pub fn save_state(state: &SessionState) {
-        if let Ok(json) = serde_json::to_string(state) {
-            write_atomic(&Self::state_path(), &json);
+        if let Ok(json) = serde_json::to_vec(state) {
+            let _ = save_atomic_locked(&GATE, &Self::state_path(), None, &json);
         }
     }
 
     pub fn save_queue(ids: &[String]) {
-        if let Ok(json) = serde_json::to_string(ids) {
-            write_atomic(&Self::queue_path(), &json);
+        if let Ok(json) = serde_json::to_vec(ids) {
+            let _ = save_atomic_locked(&GATE, &Self::queue_path(), None, &json);
         }
     }
 
     pub fn save_original_queue(ids: &[String]) {
-        if let Ok(json) = serde_json::to_string(ids) {
-            write_atomic(&Self::original_queue_path(), &json);
+        if let Ok(json) = serde_json::to_vec(ids) {
+            let _ = save_atomic_locked(&GATE, &Self::original_queue_path(), None, &json);
         }
-    }
-}
-
-fn write_atomic(path: &std::path::Path, json: &str) {
-    let Ok(_guard) = GATE.lock() else {
-        return;
-    };
-    let dir = CoverPaths::app_dir();
-    if fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let tmp = path.with_extension("json.tmp");
-    if fs::write(&tmp, json).is_ok() {
-        let _ = fs::rename(&tmp, path);
     }
 }

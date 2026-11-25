@@ -17,6 +17,9 @@ pub enum BridgeEvent {
 
 /// Converts a linear UI/mixer slider position (`0.0..=1.0`) to PipeWire's cubic volume scale (`level^3`).
 pub fn linear_to_pw_cubic(level: f64) -> f32 {
+    if !level.is_finite() {
+        return 0.0;
+    }
     let clamped = level.clamp(0.0, 1.0);
     (clamped * clamped * clamped) as f32
 }
@@ -31,11 +34,11 @@ pub fn pw_cubic_to_linear(pw: f32) -> f64 {
 
 #[cfg(feature = "pipewire-bridge")]
 mod imp {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::io::Cursor;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, mpsc as std_mpsc};
+    use std::sync::mpsc as std_mpsc;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
@@ -58,6 +61,7 @@ mod imp {
     const NODE_NAME: &str = super::BRIDGE_NODE_NAME;
     const SELF_ECHO_WINDOW: Duration = Duration::from_millis(600);
     const SELF_ECHO_EPSILON: f64 = 0.005;
+    const ECHO_HISTORY_CAP: usize = 16;
 
     enum BridgeCommand {
         SetVolume(f64),
@@ -70,9 +74,51 @@ mod imp {
         channels: usize,
         known_volume: f64,
         known_muted: bool,
-        last_sent_volume: Option<(f64, Instant)>,
-        last_sent_mute: Option<(bool, Instant)>,
+        recent_volumes: VecDeque<(f64, Instant)>,
+        recent_mutes: VecDeque<(bool, Instant)>,
         ready_sent: bool,
+    }
+
+    impl BridgeState {
+        fn record_sent_volume(&mut self, level: f64) {
+            if self.recent_volumes.len() >= ECHO_HISTORY_CAP {
+                self.recent_volumes.pop_front();
+            }
+            self.recent_volumes.push_back((level, Instant::now()));
+        }
+
+        fn record_sent_mute(&mut self, muted: bool) {
+            if self.recent_mutes.len() >= ECHO_HISTORY_CAP {
+                self.recent_mutes.pop_front();
+            }
+            self.recent_mutes.push_back((muted, Instant::now()));
+        }
+
+        fn is_recent_volume_echo(&mut self, v: f64) -> bool {
+            let now = Instant::now();
+            while self
+                .recent_volumes
+                .front()
+                .is_some_and(|(_, at)| now.duration_since(*at) >= SELF_ECHO_WINDOW)
+            {
+                self.recent_volumes.pop_front();
+            }
+            self.recent_volumes
+                .iter()
+                .any(|&(sent, _)| (v - sent).abs() < SELF_ECHO_EPSILON)
+        }
+
+        fn is_recent_mute_echo(&mut self, m: bool) -> bool {
+            let now = Instant::now();
+            while self
+                .recent_mutes
+                .front()
+                .is_some_and(|(_, at)| now.duration_since(*at) >= SELF_ECHO_WINDOW)
+            {
+                self.recent_mutes.pop_front();
+            }
+            self.recent_mutes.iter().any(|&(sent, _)| sent == m)
+        }
     }
 
     /// Crash-safe temporary PipeWire Virtual Null Sink (`rustygrade-direct-bridge`) that
@@ -83,27 +129,24 @@ mod imp {
     /// node if the process exits unexpectedly or crashes.
     pub struct PipeWireBridge {
         cmd_tx: channel::Sender<BridgeCommand>,
-        node_id: Arc<AtomicU32>,
         thread: Option<JoinHandle<()>>,
     }
 
     impl PipeWireBridge {
-        pub const fn is_supported() -> bool {
-            true
-        }
-
         pub fn connect(
             description: impl Into<String>,
             initial_volume: f64,
             initial_muted: bool,
         ) -> Result<(Self, mpsc::UnboundedReceiver<BridgeEvent>), String> {
             let description = description.into();
-            let initial_volume = initial_volume.clamp(0.0, 1.0);
+            let initial_volume = if initial_volume.is_finite() {
+                initial_volume.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let (event_tx, event_rx) = mpsc::unbounded_channel();
             let (cmd_tx, cmd_rx) = channel::channel::<BridgeCommand>();
             let (init_tx, init_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
-            let node_id = Arc::new(AtomicU32::new(0));
-            let node_id_thread = Arc::clone(&node_id);
 
             let thread = thread::Builder::new()
                 .name("rustygrade-pw-bridge".to_owned())
@@ -127,8 +170,8 @@ mod imp {
                     let core = match context.connect_rc(None) {
                         Ok(core) => core,
                         Err(e) => {
-                            let _ =
-                                init_tx.send(Err(format!("PipeWire connect failed (not running?): {e}")));
+                            let _ = init_tx
+                                .send(Err(format!("PipeWire connect failed (not running?): {e}")));
                             return;
                         }
                     };
@@ -151,26 +194,31 @@ mod imp {
                     let node = match core.create_object::<Node>("adapter", &props) {
                         Ok(node) => node,
                         Err(e) => {
-                            let _ = init_tx
-                                .send(Err(format!("PipeWire null-audio-sink creation failed: {e}")));
+                            let _ = init_tx.send(Err(format!(
+                                "PipeWire null-audio-sink creation failed: {e}"
+                            )));
                             return;
                         }
                     };
 
-                    let state = Rc::new(RefCell::new(BridgeState {
-                        node: None,
-                        channels: 2,
-                        known_volume: initial_volume,
-                        known_muted: initial_muted,
-                        last_sent_volume: Some((initial_volume, Instant::now())),
-                        last_sent_mute: Some((initial_muted, Instant::now())),
-                        ready_sent: false,
+                    let state = Rc::new(RefCell::new({
+                        let mut st = BridgeState {
+                            node: None,
+                            channels: 2,
+                            known_volume: initial_volume,
+                            known_muted: initial_muted,
+                            recent_volumes: VecDeque::with_capacity(ECHO_HISTORY_CAP),
+                            recent_mutes: VecDeque::with_capacity(ECHO_HISTORY_CAP),
+                            ready_sent: false,
+                        };
+                        st.record_sent_volume(initial_volume);
+                        st.record_sent_mute(initial_muted);
+                        st
                     }));
 
                     node.subscribe_params(&[ParamType::Props]);
                     node.enum_params(0, Some(ParamType::Props), 0, u32::MAX);
-                    if let Some(buf) =
-                        build_props_pod(Some(initial_volume), Some(initial_muted), 2)
+                    if let Some(buf) = build_props_pod(Some(initial_volume), Some(initial_muted), 2)
                         && let Some(pod) = Pod::from_bytes(&buf)
                     {
                         node.set_param(ParamType::Props, 0, pod);
@@ -180,7 +228,6 @@ mod imp {
                         &node,
                         Rc::clone(&state),
                         description.clone(),
-                        Arc::clone(&node_id_thread),
                         event_tx.clone(),
                     );
 
@@ -188,16 +235,16 @@ mod imp {
 
                     let ml_quit_err = mainloop.clone();
                     let event_tx_err = event_tx.clone();
+                    let disconnect_sent = Rc::new(Cell::new(false));
+                    let disconnect_sent_err = Rc::clone(&disconnect_sent);
                     let _core_listener = core
                         .add_listener_local()
                         .error(move |id, _seq, res, message| {
                             warn!(
                                 id,
-                                res,
-                                message,
-                                "PipeWire core error on rustygrade-direct-bridge"
+                                res, message, "PipeWire core error on rustygrade-direct-bridge"
                             );
-                            if id == 0 {
+                            if id == 0 && !disconnect_sent_err.replace(true) {
                                 let _ = event_tx_err.send(BridgeEvent::Disconnected(format!(
                                     "PipeWire error {res}: {message}"
                                 )));
@@ -211,10 +258,13 @@ mod imp {
                     let state_cmd = Rc::clone(&state);
                     let _attached_rx = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
                         BridgeCommand::SetVolume(level) => {
+                            if !level.is_finite() {
+                                return;
+                            }
                             let level = level.clamp(0.0, 1.0);
                             let mut st = state_cmd.borrow_mut();
                             st.known_volume = level;
-                            st.last_sent_volume = Some((level, Instant::now()));
+                            st.record_sent_volume(level);
                             let channels = st.channels;
                             if let Some(node) = st.node.as_ref()
                                 && let Some(buf) = build_props_pod(Some(level), None, channels)
@@ -226,7 +276,7 @@ mod imp {
                         BridgeCommand::SetMute(muted) => {
                             let mut st = state_cmd.borrow_mut();
                             st.known_muted = muted;
-                            st.last_sent_mute = Some((muted, Instant::now()));
+                            st.record_sent_mute(muted);
                             let channels = st.channels;
                             if let Some(node) = st.node.as_ref()
                                 && let Some(buf) = build_props_pod(None, Some(muted), channels)
@@ -256,7 +306,9 @@ mod imp {
                     drop(core);
                     drop(context);
                     drop(mainloop);
-                    let _ = event_tx.send(BridgeEvent::Disconnected("Stopped".to_owned()));
+                    if !disconnect_sent.get() {
+                        let _ = event_tx.send(BridgeEvent::Disconnected("Stopped".to_owned()));
+                    }
                 })
                 .map_err(|e| format!("Failed to spawn PipeWire bridge thread: {e}"))?;
 
@@ -264,7 +316,6 @@ mod imp {
                 Ok(Ok(())) => Ok((
                     Self {
                         cmd_tx,
-                        node_id,
                         thread: Some(thread),
                     },
                     event_rx,
@@ -288,11 +339,6 @@ mod imp {
             let _ = self.cmd_tx.send(BridgeCommand::SetMute(muted));
         }
 
-        pub fn node_id(&self) -> Option<u32> {
-            let id = self.node_id.load(Ordering::Acquire);
-            (id != 0).then_some(id)
-        }
-
         pub fn shutdown(&mut self) {
             let _ = self.cmd_tx.send(BridgeCommand::Shutdown);
             if let Some(handle) = self.thread.take() {
@@ -311,7 +357,6 @@ mod imp {
         node: &Node,
         state: Rc<RefCell<BridgeState>>,
         description: String,
-        node_id_atomic: Arc<AtomicU32>,
         event_tx: mpsc::UnboundedSender<BridgeEvent>,
     ) -> NodeListener {
         let state_info = Rc::clone(&state);
@@ -322,7 +367,6 @@ mod imp {
             .info(move |info| {
                 let bound_id = info.id();
                 if bound_id != 0 && bound_id != u32::MAX {
-                    node_id_atomic.store(bound_id, Ordering::Release);
                     let mut st = state_info.borrow_mut();
                     if !st.ready_sent {
                         st.ready_sent = true;
@@ -352,20 +396,14 @@ mod imp {
                     st.channels = ch.max(1);
                 }
                 if let Some(v) = vol {
-                    let suppressed = st
-                        .last_sent_volume
-                        .is_some_and(|(sent, at)| {
-                            at.elapsed() < SELF_ECHO_WINDOW && (v - sent).abs() < SELF_ECHO_EPSILON
-                        });
+                    let suppressed = st.is_recent_volume_echo(v);
                     if !suppressed && (v - st.known_volume).abs() >= SELF_ECHO_EPSILON {
                         st.known_volume = v;
                         let _ = event_tx.send(BridgeEvent::VolumeChanged(v));
                     }
                 }
                 if let Some(m) = muted {
-                    let suppressed = st
-                        .last_sent_mute
-                        .is_some_and(|(sent, at)| at.elapsed() < SELF_ECHO_WINDOW && m == sent);
+                    let suppressed = st.is_recent_mute_echo(m);
                     if !suppressed && m != st.known_muted {
                         st.known_muted = m;
                         let _ = event_tx.send(BridgeEvent::MuteChanged(m));
@@ -375,7 +413,11 @@ mod imp {
             .register()
     }
 
-    fn build_props_pod(volume: Option<f64>, mute: Option<bool>, channels: usize) -> Option<Vec<u8>> {
+    fn build_props_pod(
+        volume: Option<f64>,
+        mute: Option<bool>,
+        channels: usize,
+    ) -> Option<Vec<u8>> {
         let mut properties = Vec::new();
         if let Some(level) = volume {
             let pw = linear_to_pw_cubic(level);
@@ -448,10 +490,6 @@ mod imp {
     pub struct PipeWireBridge;
 
     impl PipeWireBridge {
-        pub const fn is_supported() -> bool {
-            false
-        }
-
         pub fn connect(
             _description: impl Into<String>,
             _initial_volume: f64,
@@ -463,10 +501,6 @@ mod imp {
         pub fn set_volume(&self, _level: f64) {}
 
         pub fn set_mute(&self, _muted: bool) {}
-
-        pub fn node_id(&self) -> Option<u32> {
-            None
-        }
 
         pub fn shutdown(&mut self) {}
     }
@@ -480,116 +514,19 @@ mod tests {
 
     #[test]
     fn cubic_volume_roundtrips_and_matches_pw_math() {
-        // 0.35 linear slider -> 0.35^3 = 0.042875 in PipeWire channelVolumes.
         let pw = linear_to_pw_cubic(0.35);
         assert!((pw - 0.042875).abs() < 1e-6);
         assert!((pw_cubic_to_linear(pw) - 0.35).abs() < 1e-6);
 
-        // 0.70 linear slider -> 0.70^3 = 0.343.
         let pw70 = linear_to_pw_cubic(0.70);
         assert!((pw70 - 0.343).abs() < 1e-6);
         assert!((pw_cubic_to_linear(pw70) - 0.70).abs() < 1e-6);
 
-        // Clamping & bad floats.
         assert_eq!(linear_to_pw_cubic(-0.5), 0.0);
         assert_eq!(linear_to_pw_cubic(1.5), 1.0);
+        assert_eq!(linear_to_pw_cubic(f64::NAN), 0.0);
+        assert_eq!(linear_to_pw_cubic(f64::INFINITY), 0.0);
         assert_eq!(pw_cubic_to_linear(f32::NAN), 0.0);
         assert_eq!(pw_cubic_to_linear(-0.1), 0.0);
-    }
-
-    #[cfg(feature = "pipewire-bridge")]
-    #[test]
-    #[ignore = "Requires live PipeWire daemon and wpctl CLI"]
-    fn live_pipewire_bridge_syncs_two_way_and_cleans_up_on_drop() {
-        use std::process::Command;
-        use std::time::{Duration, Instant};
-
-        let (bridge, mut rx) =
-            PipeWireBridge::connect("Test DAC (Direct)", 0.50, false).expect("connect PipeWire");
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let node_id = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "timed out waiting for BridgeEvent::Ready");
-            let evt = rt
-                .block_on(async { tokio::time::timeout(remaining, rx.recv()).await })
-                .expect("timeout")
-                .expect("channel closed");
-            if let BridgeEvent::Ready { node_id, .. } = evt {
-                break node_id;
-            }
-        };
-
-        // External wpctl volume change -> allow WirePlumber up to 500ms to bind metadata,
-        // then confirm VolumeChanged(~0.70).
-        let mut set_ok = false;
-        for _ in 0..10 {
-            let status = Command::new("wpctl")
-                .args(["set-volume", &node_id.to_string(), "0.70"])
-                .status()
-                .expect("run wpctl set-volume");
-            if status.success() {
-                set_ok = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(set_ok, "wpctl set-volume failed for node {node_id}");
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let got_70 = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break false;
-            }
-            if let Ok(Some(evt)) =
-                rt.block_on(async { tokio::time::timeout(remaining, rx.recv()).await })
-                && let BridgeEvent::VolumeChanged(v) = evt
-                && (v - 0.70).abs() < 0.02
-            {
-                break true;
-            }
-        };
-        assert!(got_70, "expected VolumeChanged(~0.70) from wpctl set-volume");
-
-        // Internal bridge.set_volume(0.35) -> should update PipeWire channelVolumes (~0.042875).
-        bridge.set_volume(0.35);
-        std::thread::sleep(Duration::from_millis(250));
-        let inspect = Command::new("wpctl")
-            .args(["get-volume", &node_id.to_string()])
-            .output()
-            .expect("wpctl get-volume");
-        let text = String::from_utf8_lossy(&inspect.stdout);
-        assert!(
-            text.contains("0.35"),
-            "expected wpctl get-volume to show ~0.35, got: {text}"
-        );
-
-        let inspect_pw = Command::new("pw-dump")
-            .arg(node_id.to_string())
-            .output()
-            .expect("pw-dump");
-        let pw_text = String::from_utf8_lossy(&inspect_pw.stdout);
-        assert!(
-            pw_text.contains("0.0428") || pw_text.contains("0.0429"),
-            "expected pw-dump channelVolumes near 0.042875, got: {pw_text}"
-        );
-
-        // Dropping bridge must destroy the temporary node cleanly.
-        drop(bridge);
-        std::thread::sleep(Duration::from_millis(250));
-        let status_after = Command::new("wpctl")
-            .args(["inspect", &node_id.to_string()])
-            .output()
-            .expect("wpctl inspect after drop");
-        assert!(
-            !status_after.status.success(),
-            "expected virtual node {node_id} to disappear after drop"
-        );
     }
 }

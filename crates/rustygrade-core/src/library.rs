@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -9,9 +9,11 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::collections::CollectionsStore;
-use crate::covers::delete_unreferenced_covers;
+use crate::covers::delete_unreferenced_covers_with_extra;
+use crate::json_store::{LoadStatus, load_with_backup, save_atomic_bytes};
 use crate::models::{Album, Track};
 use crate::paths::CoverPaths;
+use crate::scanner::collect_album_cover_candidates;
 
 #[derive(Debug, Error)]
 pub enum LibraryError {
@@ -52,7 +54,10 @@ pub struct TrackDto {
     pub duration: f64,
     pub file_path: Option<String>,
     pub src: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_i32_lenient")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_opt_i32_lenient"
+    )]
     pub track_number: Option<i32>,
     #[serde(deserialize_with = "de_i32_lenient")]
     pub disc_number: i32,
@@ -63,9 +68,15 @@ pub struct TrackDto {
     pub bits_per_sample: i32,
     #[serde(deserialize_with = "de_i32_lenient")]
     pub channels: i32,
-    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_i64_lenient")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_opt_i64_lenient"
+    )]
     pub mtime: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_i64_lenient")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_opt_i64_lenient"
+    )]
     pub size: Option<i64>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -74,10 +85,27 @@ pub struct TrackDto {
 /// Keeps the order of the keys in library.json, like the C# dictionary (ties in "Recently Added" depend on it).
 pub type LibraryMap = IndexMap<String, AlbumDto>;
 
-static WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static RESTORED_FROM_BACKUP: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct LibraryStore;
+
+fn resolve_library_key(library: &LibraryMap, name: &str, artist: &str) -> Option<String> {
+    if let Some(a) = library.get(name) {
+        let dto_artist = a.artist.as_deref().unwrap_or("Unknown Artist");
+        let dto_aa = a.album_artist.as_deref().unwrap_or("");
+        if artist.is_empty() || dto_artist == artist || dto_aa == artist {
+            return Some(name.to_owned());
+        }
+    }
+    library
+        .iter()
+        .find(|(k, a)| {
+            let dto_name = a.name.as_deref().unwrap_or(k.as_str());
+            let dto_artist = a.artist.as_deref().unwrap_or("Unknown Artist");
+            dto_name == name && (artist.is_empty() || dto_artist == artist)
+        })
+        .map(|(k, _)| k.clone())
+}
 
 impl LibraryStore {
     pub fn library_path() -> PathBuf {
@@ -92,10 +120,6 @@ impl LibraryStore {
         CoverPaths::app_dir().join("library.json.corrupt")
     }
 
-    pub fn restored_from_backup() -> bool {
-        RESTORED_FROM_BACKUP.lock().map(|g| *g).unwrap_or(false)
-    }
-
     pub fn write_lock() -> &'static Mutex<()> {
         &WRITE_LOCK
     }
@@ -106,80 +130,66 @@ impl LibraryStore {
     }
 
     pub fn load_raw() -> Result<LibraryMap, LibraryError> {
-        let path = Self::library_path();
-        if !path.exists() {
-            return Ok(LibraryMap::new());
+        match load_with_backup(
+            &Self::library_path(),
+            &Self::backup_path(),
+            &Self::damaged_path(),
+            |bytes| serde_json::from_slice::<LibraryMap>(bytes).ok(),
+        ) {
+            LoadStatus::Ok(parsed) => Ok(parsed),
+            LoadStatus::Missing => Ok(LibraryMap::new()),
+            LoadStatus::Corrupt => Err(LibraryError::Corrupt),
         }
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(parsed) = serde_json::from_slice::<LibraryMap>(&bytes)
-        {
-            return Ok(parsed);
-        }
-
-        let _ = fs::copy(&path, Self::damaged_path());
-        let backup = Self::backup_path();
-        if backup.exists()
-            && let Ok(bytes) = fs::read(&backup)
-            && let Ok(parsed) = serde_json::from_slice::<LibraryMap>(&bytes)
-        {
-            let _ = fs::copy(&backup, &path);
-            if let Ok(mut flag) = RESTORED_FROM_BACKUP.lock() {
-                *flag = true;
-            }
-            return Ok(parsed);
-        }
-        Err(LibraryError::Corrupt)
     }
 
     pub fn save_raw(library: &LibraryMap) -> Result<(), LibraryError> {
-        let dir = CoverPaths::app_dir();
-        fs::create_dir_all(&dir)?;
-        let path = Self::library_path();
-        let backup = Self::backup_path();
-        let tmp = CoverPaths::app_dir().join("library.json.tmp");
         let bytes = serde_json::to_vec(library).map_err(std::io::Error::other)?;
-        fs::write(&tmp, bytes)?;
-        if path.exists() {
-            let _ = fs::copy(&path, &backup);
-        }
-        fs::rename(&tmp, &path)?;
+        save_atomic_bytes(&Self::library_path(), Some(&Self::backup_path()), &bytes)?;
         Ok(())
     }
 
-    pub fn delete_albums(names: &[String]) -> Result<usize, LibraryError> {
-        let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
+    pub fn delete_albums(
+        targets: &[(String, String)],
+        extra_pinned_covers: &HashSet<PathBuf>,
+    ) -> Result<usize, LibraryError> {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut library = Self::load_raw()?;
         let mut removed = 0;
         let mut detached = Vec::new();
-        for name in names {
-            if let Some(album) = library.shift_remove(name) {
+        for (name, artist) in targets {
+            let Some(key) = resolve_library_key(&library, name, artist) else {
+                continue;
+            };
+            if let Some(album) = library.shift_remove(&key) {
                 removed += 1;
-                if let Some(p) = CoverPaths::to_local_path(album.cover_art.as_deref()) {
-                    detached.push(p);
-                }
-                if let Some(p) = CoverPaths::to_local_path(album.cover_art_full.as_deref()) {
-                    detached.push(p);
-                }
-                detached.push(CoverPaths::thumb_path(name));
-                detached.push(CoverPaths::full_path(name));
+                collect_album_cover_candidates(&key, &album, &mut detached);
             }
         }
         if removed > 0 {
             Self::save_raw(&library)?;
             let collections = CollectionsStore::load();
-            delete_unreferenced_covers(&detached, &library, &collections);
+            delete_unreferenced_covers_with_extra(
+                &detached,
+                &library,
+                &collections,
+                extra_pinned_covers,
+            );
         }
         Ok(removed)
     }
 
-    /// Stores a hand-made track order for album `name` (an album without track numbers, whose
-    /// tracks keep their order in library.json). Tracks are matched by their id (as [`map_album`]
-    /// gives it); tracks missing from `ids` keep their relative order after the listed ones.
-    /// Returns whether the album was found.
-    pub fn set_album_track_order(name: &str, ids: &[String]) -> Result<bool, LibraryError> {
-        let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
+    /// Stores a hand-made track order for `(name, artist)`. Returns whether the album was found.
+    pub fn set_album_track_order(
+        name: &str,
+        artist: &str,
+        ids: &[String],
+    ) -> Result<bool, LibraryError> {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut library = Self::load_raw()?;
-        let Some(tracks) = library.get_mut(name).and_then(|a| a.tracks.as_mut()) else {
+        let Some(key) = resolve_library_key(&library, name, artist) else {
+            return Ok(false);
+        };
+        let Some(tracks) = library.get_mut(&key).and_then(|a| a.tracks.as_mut()) else {
             return Ok(false);
         };
         reorder_by_ids(tracks, ids, |t| t.id.as_deref().or(t.file_path.as_deref()));
@@ -187,21 +197,20 @@ impl LibraryStore {
         Ok(true)
     }
 
-    pub fn clear_covers(names: &[String]) -> Result<(), LibraryError> {
-        let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
+    pub fn clear_covers(
+        targets: &[(String, String)],
+        extra_pinned_covers: &HashSet<PathBuf>,
+    ) -> Result<(), LibraryError> {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut library = Self::load_raw()?;
         let mut changed = false;
         let mut detached = Vec::new();
-        for name in names {
-            if let Some(album) = library.get_mut(name) {
-                if let Some(p) = CoverPaths::to_local_path(album.cover_art.as_deref()) {
-                    detached.push(p);
-                }
-                if let Some(p) = CoverPaths::to_local_path(album.cover_art_full.as_deref()) {
-                    detached.push(p);
-                }
-                detached.push(CoverPaths::thumb_path(name));
-                detached.push(CoverPaths::full_path(name));
+        for (name, artist) in targets {
+            let Some(key) = resolve_library_key(&library, name, artist) else {
+                continue;
+            };
+            if let Some(album) = library.get_mut(&key) {
+                collect_album_cover_candidates(&key, album, &mut detached);
                 album.cover_art = None;
                 album.cover_art_full = None;
                 changed = true;
@@ -210,7 +219,12 @@ impl LibraryStore {
         if changed {
             Self::save_raw(&library)?;
             let collections = CollectionsStore::load();
-            delete_unreferenced_covers(&detached, &library, &collections);
+            delete_unreferenced_covers_with_extra(
+                &detached,
+                &library,
+                &collections,
+                extra_pinned_covers,
+            );
         }
         Ok(())
     }
@@ -228,7 +242,7 @@ impl LibraryStore {
         if stale.is_empty() {
             return Ok(0);
         }
-        let _guard = WRITE_LOCK.lock().expect("library lock poisoned");
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for old in &stale {
             let target = old.with_extension("");
             if target.exists() {
@@ -265,10 +279,13 @@ pub(crate) fn try_delete(path: &Path) {
 }
 
 pub fn map_album(a: AlbumDto) -> Album {
-    let name = a.name.clone().unwrap_or_else(|| "Unknown Album".to_owned());
+    let name = a
+        .name
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Unknown Album".to_owned());
     let album_artist = a
         .artist
-        .clone()
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown Artist".to_owned());
     let thumb = CoverPaths::to_local_path(a.cover_art.as_deref());
     let full = CoverPaths::to_local_path(a.cover_art_full.as_deref()).or_else(|| thumb.clone());
@@ -290,11 +307,18 @@ pub fn map_album(a: AlbumDto) -> Album {
                     .unwrap_or("Unknown")
                     .to_owned(),
             };
-            let id = t.id.unwrap_or_else(|| file_path.clone());
+            let id = match t.id {
+                Some(s) if !s.is_empty() => s,
+                _ => file_path.clone(),
+            };
+            let artist = match t.artist {
+                Some(s) if !s.is_empty() => s,
+                _ => album_artist.clone(),
+            };
             Some(Track {
                 id,
                 title,
-                artist: t.artist.unwrap_or_else(|| album_artist.clone()),
+                artist,
                 album: name.clone(),
                 duration: t.duration,
                 file_path,
@@ -324,12 +348,18 @@ pub fn map_album(a: AlbumDto) -> Album {
 /// Puts `items` in the order of `ids` (matched through `id_of`); items whose id is not listed keep
 /// their relative order after the listed ones, and listed ids with no item are skipped.
 pub fn reorder_by_ids<T>(items: &mut Vec<T>, ids: &[String], id_of: impl Fn(&T) -> Option<&str>) {
-    let rank: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let rank: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
     let mut keyed: Vec<(usize, usize, T)> = std::mem::take(items)
         .into_iter()
         .enumerate()
         .map(|(pos, item)| {
-            let r = id_of(&item).and_then(|id| rank.get(id).copied()).unwrap_or(usize::MAX);
+            let r = id_of(&item)
+                .and_then(|id| rank.get(id).copied())
+                .unwrap_or(usize::MAX);
             (r, pos, item)
         })
         .collect();
@@ -337,13 +367,18 @@ pub fn reorder_by_ids<T>(items: &mut Vec<T>, ids: &[String], id_of: impl Fn(&T) 
     items.extend(keyed.into_iter().map(|(_, _, item)| item));
 }
 
-/// `albums` with album `name`'s tracks put in the order of `ids` (see [`reorder_by_ids`]).
-pub fn with_album_track_order(albums: &[Album], name: &str, ids: &[String]) -> Vec<Album> {
+/// `albums` with `(name, artist)`'s tracks put in the order of `ids` (see [`reorder_by_ids`]).
+pub fn with_album_track_order(
+    albums: &[Album],
+    name: &str,
+    artist: &str,
+    ids: &[String],
+) -> Vec<Album> {
     albums
         .iter()
         .map(|a| {
             let mut a = a.clone();
-            if a.name == name {
+            if a.name == name && (artist.is_empty() || a.artist == artist) {
                 reorder_by_ids(&mut a.tracks, ids, |t| Some(t.id.as_str()));
             }
             a
@@ -351,11 +386,12 @@ pub fn with_album_track_order(albums: &[Album], name: &str, ids: &[String]) -> V
         .collect()
 }
 
-pub fn build_track_index(albums: &[Album]) -> HashMap<String, (Track, Album)> {
-    let mut map = HashMap::new();
+pub fn build_track_map(albums: &[Album]) -> HashMap<&str, &Track> {
+    let total = albums.iter().map(|a| a.tracks.len()).sum();
+    let mut map = HashMap::with_capacity(total);
     for album in albums {
         for track in &album.tracks {
-            map.insert(track.id.clone(), (track.clone(), album.clone()));
+            map.insert(track.id.as_str(), track);
         }
     }
     map
@@ -368,7 +404,10 @@ fn de_i32_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
 fn de_opt_i32_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
     let v = Option::<Value>::deserialize(d)?;
     Ok(match v {
-        Some(Value::Number(n)) => n.as_i64().map(|x| x as i32).or_else(|| n.as_f64().map(|x| x as i32)),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(|x| x as i32)
+            .or_else(|| n.as_f64().map(|x| x as i32)),
         Some(Value::String(s)) => s.trim().parse::<i32>().ok(),
         _ => None,
     })
@@ -400,8 +439,7 @@ fn de_f64_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 mod tests {
     use super::*;
     use crate::covers::save_cover_bytes;
-    use image::{DynamicImage, ImageFormat};
-    use std::io::Cursor;
+    use crate::test_util::{TempDir, solid_png};
 
     #[test]
     fn reorder_by_ids_puts_listed_first_and_keeps_the_rest() {
@@ -413,43 +451,51 @@ mod tests {
 
     #[test]
     fn delete_albums_preserves_shared_cover_until_last_reference_is_removed() {
-        let dir = std::env::temp_dir().join(format!("retro-lib-del-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = TempDir::new("lib-del");
         crate::paths::with_test_app_dir(&dir, || {
-            let mut png = Cursor::new(Vec::new());
-            DynamicImage::ImageRgb8(image::RgbImage::new(64, 64))
-                .write_to(&mut png, ImageFormat::Png)
-                .unwrap();
-            let cover_path = save_cover_bytes(&png.into_inner()).unwrap();
+            let cover_path = save_cover_bytes(&solid_png(64, 64, [0, 0, 0])).unwrap();
             let cover_url = CoverPaths::to_file_url(&cover_path);
 
             let mut lib = LibraryMap::new();
-            lib.insert(
-                "Album 1".to_owned(),
-                AlbumDto {
-                    name: Some("Album 1".to_owned()),
-                    cover_art: Some(cover_url.clone()),
-                    cover_art_full: Some(cover_url.clone()),
-                    ..Default::default()
-                },
-            );
-            lib.insert(
-                "Album 2".to_owned(),
-                AlbumDto {
-                    name: Some("Album 2".to_owned()),
-                    cover_art: Some(cover_url.clone()),
-                    cover_art_full: Some(cover_url),
-                    ..Default::default()
-                },
-            );
+            for (name, artist) in [("Album 1", "Art A"), ("Album 2", "Art B")] {
+                lib.insert(
+                    name.to_owned(),
+                    AlbumDto {
+                        name: Some(name.to_owned()),
+                        artist: Some(artist.to_owned()),
+                        cover_art: Some(cover_url.clone()),
+                        cover_art_full: Some(cover_url.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
             LibraryStore::save_raw(&lib).unwrap();
 
-            assert_eq!(LibraryStore::delete_albums(&["Album 1".to_owned()]).unwrap(), 1);
-            assert!(cover_path.exists(), "Album 2 still references the shared cover");
+            assert_eq!(
+                LibraryStore::delete_albums(
+                    &[("Album 1".to_owned(), "Art A".to_owned())],
+                    &HashSet::new(),
+                )
+                .unwrap(),
+                1
+            );
+            assert!(
+                cover_path.exists(),
+                "Album 2 still references the shared cover"
+            );
 
-            assert_eq!(LibraryStore::delete_albums(&["Album 2".to_owned()]).unwrap(), 1);
-            assert!(!cover_path.exists(), "shared cover must be removed when last album is deleted");
+            assert_eq!(
+                LibraryStore::delete_albums(
+                    &[("Album 2".to_owned(), "Art B".to_owned())],
+                    &HashSet::new(),
+                )
+                .unwrap(),
+                1
+            );
+            assert!(
+                !cover_path.exists(),
+                "shared cover must be removed when last album is deleted"
+            );
         });
-        let _ = fs::remove_dir_all(&dir);
     }
 }

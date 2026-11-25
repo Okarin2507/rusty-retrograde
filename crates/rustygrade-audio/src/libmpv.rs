@@ -18,7 +18,7 @@ pub enum LibMpvError {
     )]
     LibraryNotFound,
     #[error("libmpv missing symbol {0}")]
-    MissingSymbol(&'static str),
+    MissingSymbol(String),
     #[error("libmpv: {0}")]
     Mpv(String),
 }
@@ -61,13 +61,6 @@ impl MpvValue {
         match self {
             Self::Int(i) => Some(*i),
             Self::Double(d) => Some(*d as i64),
-            _ => None,
-        }
-    }
-
-    pub fn as_array(&self) -> Option<&[MpvValue]> {
-        match self {
-            Self::Array(a) => Some(a.as_slice()),
             _ => None,
         }
     }
@@ -208,18 +201,24 @@ struct MpvVtable {
 unsafe impl Send for MpvVtable {}
 unsafe impl Sync for MpvVtable {}
 
-static MPV_VTABLE: OnceLock<Result<MpvVtable, String>> = OnceLock::new();
+static MPV_VTABLE: OnceLock<Result<MpvVtable, LibMpvError>> = OnceLock::new();
 
 fn load_vtable() -> Result<&'static MpvVtable, LibMpvError> {
     let res = MPV_VTABLE.get_or_init(|| unsafe {
         let lib = Library::new("libmpv.so.2")
             .or_else(|_| Library::new("libmpv.so"))
-            .map_err(|_| "not_found".to_owned())?;
+            .map_err(|_| LibMpvError::LibraryNotFound)?;
 
         macro_rules! sym {
             ($name:literal) => {
-                *lib.get($name)
-                    .map_err(|_| String::from_utf8_lossy($name).into_owned())?
+                *lib.get($name).map_err(|_| {
+                    let sym_name = CStr::from_bytes_with_nul($name)
+                        .ok()
+                        .and_then(|s| s.to_str().ok())
+                        .unwrap_or("mpv_?")
+                        .to_owned();
+                    LibMpvError::MissingSymbol(sym_name)
+                })?
             };
         }
 
@@ -242,8 +241,9 @@ fn load_vtable() -> Result<&'static MpvVtable, LibMpvError> {
 
     match res {
         Ok(vt) => Ok(vt),
-        Err(e) if e == "not_found" => Err(LibMpvError::LibraryNotFound),
-        Err(_) => Err(LibMpvError::MissingSymbol("mpv_*")),
+        Err(LibMpvError::LibraryNotFound) => Err(LibMpvError::LibraryNotFound),
+        Err(LibMpvError::MissingSymbol(sym)) => Err(LibMpvError::MissingSymbol(sym.clone())),
+        Err(LibMpvError::Mpv(msg)) => Err(LibMpvError::Mpv(msg.clone())),
     }
 }
 
@@ -270,12 +270,15 @@ impl LibMpvClient {
         }
 
         for &(name, value) in options {
-            if let (Ok(cn), Ok(cv)) = (CString::new(name), CString::new(value)) {
-                let rc = unsafe { (vt.set_option_string)(handle, cn.as_ptr(), cv.as_ptr()) };
-                if rc < 0 {
-                    let msg = unsafe { error_str(vt, rc) };
-                    warn!(option = name, value, error = %msg, "mpv_set_option_string failed");
+            match (CString::new(name), CString::new(value)) {
+                (Ok(cn), Ok(cv)) => {
+                    let rc = unsafe { (vt.set_option_string)(handle, cn.as_ptr(), cv.as_ptr()) };
+                    if rc < 0 {
+                        let msg = unsafe { error_str(vt, rc) };
+                        warn!(option = name, value, error = %msg, "mpv_set_option_string failed");
+                    }
                 }
+                _ => warn!(option = name, "skipping mpv option containing interior NUL"),
             }
         }
 
@@ -292,7 +295,7 @@ impl LibMpvClient {
         let disp_bg = Arc::clone(&disposing);
         let shut_bg = Arc::clone(&shut_down);
 
-        let thread = thread::Builder::new()
+        let thread = match thread::Builder::new()
             .name("libmpv-events".to_owned())
             .spawn(move || {
                 let h = h_usize as *mut c_void;
@@ -323,8 +326,13 @@ impl LibMpvClient {
                 if unexpected {
                     let _ = tx.send(MpvEventMsg::Shutdown { unexpected: true });
                 }
-            })
-            .map_err(|e| LibMpvError::Mpv(format!("failed to spawn mpv thread: {e}")))?;
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                unsafe { (vt.terminate_destroy)(handle) };
+                return Err(LibMpvError::Mpv(format!("failed to spawn mpv thread: {e}")));
+            }
+        };
 
         Ok(Self {
             vt,
@@ -339,69 +347,89 @@ impl LibMpvClient {
         !self.shut_down.load(Ordering::Acquire) && !self.disposing.load(Ordering::Acquire)
     }
 
-    fn with_live_handle<F>(&self, f: F)
+    fn with_live_handle<F>(&self, op: &str, f: F) -> bool
     where
-        F: FnOnce(*mut c_void),
+        F: FnOnce(*mut c_void) -> c_int,
     {
         let guard = match self.handle.read() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         if !self.is_alive() {
-            return;
+            return false;
         }
-        if let Some(h) = *guard {
-            f(h as *mut c_void);
+        let Some(h) = *guard else {
+            return false;
+        };
+        let rc = f(h as *mut c_void);
+        if rc < 0 {
+            let msg = unsafe { error_str(self.vt, rc) };
+            warn!(op, code = rc, error = %msg, "libmpv FFI call failed");
+            return false;
         }
+        true
     }
 
-    pub fn command(&self, user_data: u64, args: &[&str]) {
+    pub fn command(&self, user_data: u64, args: &[&str]) -> bool {
         let Ok(cstrings) = args
             .iter()
             .map(|s| CString::new(*s))
             .collect::<Result<Vec<_>, _>>()
         else {
-            return;
+            warn!(cmd = ?args.first(), "libmpv command rejected due to interior NUL");
+            return false;
         };
         let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
         ptrs.push(ptr::null());
-        self.with_live_handle(|h| unsafe {
-            (self.vt.command_async)(h, user_data, ptrs.as_mut_ptr());
-        });
+        self.with_live_handle("mpv_command_async", |h| unsafe {
+            (self.vt.command_async)(h, user_data, ptrs.as_mut_ptr())
+        })
     }
 
-    pub fn get_property(&self, user_data: u64, name: &str) {
+    pub fn get_property(&self, user_data: u64, name: &str) -> bool {
         let Ok(cn) = CString::new(name) else {
-            return;
+            warn!(
+                property = name,
+                "libmpv get_property rejected due to interior NUL"
+            );
+            return false;
         };
-        self.with_live_handle(|h| unsafe {
-            (self.vt.get_property_async)(h, user_data, cn.as_ptr(), format::NODE);
-        });
+        self.with_live_handle("mpv_get_property_async", |h| unsafe {
+            (self.vt.get_property_async)(h, user_data, cn.as_ptr(), format::NODE)
+        })
     }
 
-    pub fn set_property(&self, name: &str, value: &str) {
+    pub fn set_property(&self, name: &str, value: &str) -> bool {
         let (Ok(cn), Ok(cv)) = (CString::new(name), CString::new(value)) else {
-            return;
+            warn!(
+                property = name,
+                "libmpv set_property rejected due to interior NUL"
+            );
+            return false;
         };
         let mut ptr = cv.as_ptr();
-        self.with_live_handle(|h| unsafe {
+        self.with_live_handle("mpv_set_property_async", |h| unsafe {
             (self.vt.set_property_async)(
                 h,
                 0,
                 cn.as_ptr(),
                 format::STRING,
                 (&raw mut ptr).cast::<c_void>(),
-            );
-        });
+            )
+        })
     }
 
-    pub fn observe(&self, user_data: u64, name: &str) {
+    pub fn observe(&self, user_data: u64, name: &str) -> bool {
         let Ok(cn) = CString::new(name) else {
-            return;
+            warn!(
+                property = name,
+                "libmpv observe rejected due to interior NUL"
+            );
+            return false;
         };
-        self.with_live_handle(|h| unsafe {
-            (self.vt.observe_property)(h, user_data, cn.as_ptr(), format::NODE);
-        });
+        self.with_live_handle("mpv_observe_property", |h| unsafe {
+            (self.vt.observe_property)(h, user_data, cn.as_ptr(), format::NODE)
+        })
     }
 
     pub fn shutdown(&self) {
@@ -462,7 +490,9 @@ unsafe fn error_str(vt: &MpvVtable, code: c_int) -> String {
     if ptr.is_null() {
         code.to_string()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -473,11 +503,7 @@ unsafe fn parse_event(vt: &MpvVtable, ev: *mut MpvEvent) -> Option<MpvEventMsg> 
             if ev_ref.reply_userdata == 0 {
                 return None;
             }
-            let error = if ev_ref.error < 0 {
-                Some(unsafe { error_str(vt, ev_ref.error) })
-            } else {
-                None
-            };
+            let error = (ev_ref.error < 0).then(|| unsafe { error_str(vt, ev_ref.error) });
             let data = if ev_ref.error >= 0 && !ev_ref.data.is_null() {
                 let cmd = unsafe { &*(ev_ref.data as *const MpvEventCommand) };
                 unsafe { read_node(&cmd.result) }
@@ -494,11 +520,7 @@ unsafe fn parse_event(vt: &MpvVtable, ev: *mut MpvEvent) -> Option<MpvEventMsg> 
             if ev_ref.reply_userdata == 0 {
                 return None;
             }
-            let error = if ev_ref.error < 0 {
-                Some(unsafe { error_str(vt, ev_ref.error) })
-            } else {
-                None
-            };
+            let error = (ev_ref.error < 0).then(|| unsafe { error_str(vt, ev_ref.error) });
             let data = if ev_ref.error >= 0 && !ev_ref.data.is_null() {
                 let prop = unsafe { &*(ev_ref.data as *const MpvEventProperty) };
                 unsafe { read_property(prop) }
@@ -549,11 +571,7 @@ unsafe fn parse_event(vt: &MpvVtable, ev: *mut MpvEvent) -> Option<MpvEventMsg> 
                 _ => "unknown",
             }
             .to_owned();
-            let file_error = if ef.reason == 4 {
-                Some(unsafe { error_str(vt, ef.error) })
-            } else {
-                None
-            };
+            let file_error = (ef.reason == 4).then(|| unsafe { error_str(vt, ef.error) });
             Some(MpvEventMsg::EndFile {
                 reason,
                 playlist_entry_id: ef.playlist_entry_id,
@@ -580,7 +598,11 @@ unsafe fn read_node(node: &MpvNode) -> MpvValue {
             if ptr.is_null() {
                 MpvValue::None
             } else {
-                MpvValue::String(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+                MpvValue::String(
+                    unsafe { CStr::from_ptr(ptr) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
             }
         }
         format::FLAG => MpvValue::Bool(unsafe { node.u.flag } != 0),

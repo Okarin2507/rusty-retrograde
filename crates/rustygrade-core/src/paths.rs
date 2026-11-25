@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 /// Cover cache naming and app directory resolution shared with the Electron & C# builds
 /// (`~/.rustygrade/covers/{hash}_thumb.jpg`).
 pub struct CoverPaths;
+
+static MIGRATED: Once = Once::new();
 
 /// One-time move of the data folder used before the rename (`~/.retrograde`) to `~/.rustygrade`.
 /// Does nothing when the new folder already exists or the old one is absent.
@@ -10,7 +13,12 @@ fn migrate_legacy_dir(home: &Path, dir: &Path) {
     let legacy = home.join(".retrograde");
     if !dir.exists() && legacy.is_dir() && std::fs::rename(&legacy, dir).is_ok() {
         // Cover URLs in the library are absolute `file://` paths into the old folder.
-        for name in ["library.json", "library.json.bak", "native-collections.json", "native-collections.json.bak"] {
+        for name in [
+            "library.json",
+            "library.json.bak",
+            "native-collections.json",
+            "native-collections.json.bak",
+        ] {
             let path = dir.join(name);
             if let Ok(text) = std::fs::read_to_string(&path)
                 && text.contains("/.retrograde/")
@@ -44,6 +52,50 @@ pub(crate) fn with_test_app_dir<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+fn is_temp_cover_name(name: &str) -> bool {
+    name.contains(".tmp") || name.ends_with(".resync-old") || name.ends_with(".shrink-tmp")
+}
+
+/// Decodes `file://` / `file://localhost/` URIs (stripping `?query` and `#fragment` and
+/// legacy `/C:/` drive prefixes). Returns `None` if `raw` does not start with `file://`.
+pub(crate) fn decode_file_uri(raw: &str) -> Option<String> {
+    if !raw
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"file://"))
+    {
+        return None;
+    }
+    let mut body = &raw[7..];
+    if body
+        .as_bytes()
+        .get(..10)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"localhost/"))
+    {
+        body = &body[9..];
+    }
+    let before_qf = match (body.find('?'), body.find('#')) {
+        (Some(q), Some(h)) => &body[..q.min(h)],
+        (Some(q), None) => &body[..q],
+        (None, Some(h)) => &body[..h],
+        (None, None) => body,
+    };
+    let bytes = before_qf.as_bytes();
+    let p = if bytes.len() > 2
+        && bytes[0] == b'/'
+        && bytes[2] == b':'
+        && bytes[1].is_ascii_alphabetic()
+    {
+        &before_qf[1..]
+    } else {
+        before_qf
+    };
+    let decoded = urlencoding::decode(p)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| p.to_owned());
+    Some(decoded)
+}
+
 impl CoverPaths {
     /// `~/.rustygrade`, or `RETRO_APPDIR` when set and non-empty (tests run against a scratch copy).
     pub fn app_dir() -> PathBuf {
@@ -61,7 +113,7 @@ impl CoverPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         let dir = home.join(".rustygrade");
-        migrate_legacy_dir(&home, &dir);
+        MIGRATED.call_once(|| migrate_legacy_dir(&home, &dir));
         dir
     }
 
@@ -81,8 +133,7 @@ impl CoverPaths {
                 .wrapping_sub(hash)
                 .wrapping_add(unit as i32);
         }
-        let abs = (hash as i64).abs();
-        to_base36(abs)
+        to_base36((hash as i64).abs())
     }
 
     pub fn thumb_path(album_name: &str) -> PathBuf {
@@ -103,12 +154,7 @@ impl CoverPaths {
         }
         path.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|name| {
-                name.starts_with("c_")
-                    && !name.contains(".tmp.")
-                    && !name.ends_with(".resync-old")
-                    && !name.ends_with(".shrink-tmp")
-            })
+            .is_some_and(|name| name.starts_with("c_") && !is_temp_cover_name(name))
     }
 
     pub fn is_managed_cover_file(path: &Path) -> bool {
@@ -118,10 +164,7 @@ impl CoverPaths {
         path.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| {
-                if name.contains(".tmp")
-                    || name.ends_with(".resync-old")
-                    || name.ends_with(".shrink-tmp")
-                {
+                if is_temp_cover_name(name) {
                     return false;
                 }
                 let lower = name.to_ascii_lowercase();
@@ -138,20 +181,7 @@ impl CoverPaths {
         if raw.is_empty() {
             return None;
         }
-        if raw.as_bytes().get(..7).is_some_and(|b| b.eq_ignore_ascii_case(b"file://")) {
-            let stripped = match raw.find('?') {
-                Some(idx) => &raw[..idx],
-                None => raw,
-            };
-            let mut p = &stripped[7..];
-            // Legacy Windows file:///C:/... safety just in case a shared library.json contains it.
-            let bytes = p.as_bytes();
-            if bytes.len() > 2 && bytes[0] == b'/' && bytes[2] == b':' {
-                p = &p[1..];
-            }
-            let decoded = urlencoding::decode(p)
-                .map(|c| c.into_owned())
-                .unwrap_or_else(|_| p.to_owned());
+        if let Some(decoded) = decode_file_uri(raw) {
             return Some(PathBuf::from(decoded));
         }
         Some(PathBuf::from(raw))
@@ -189,33 +219,28 @@ mod tests {
 
     #[test]
     fn hash_name_matches_real_library_and_utf16_surrogates() {
-        // Verified directly against ~/.rustygrade/library.json:
         assert_eq!(
             CoverPaths::hash_name("Ado 1st Live Kigeki (Live At Zepp DiverCity, 2022)"),
             "oy1a16"
         );
         assert_eq!(CoverPaths::hash_name(""), "0");
-        // Emoji requires UTF-16 surrogate pair handling rather than Unicode scalar codepoints.
         assert_eq!(CoverPaths::hash_name("🎵"), "120ah");
-        // Japanese / CJK title
         assert_eq!(CoverPaths::hash_name("残夢"), "is53");
     }
 
     #[test]
     fn to_local_path_handles_file_urls_and_queries() {
-        let p = CoverPaths::to_local_path(Some("file:///home/okarin/.rustygrade/covers/a%20b.jpg?t=123"))
-            .unwrap();
+        let p = CoverPaths::to_local_path(Some(
+            "file:///home/okarin/.rustygrade/covers/a%20b.jpg?t=123",
+        ))
+        .unwrap();
         assert_eq!(p, PathBuf::from("/home/okarin/.rustygrade/covers/a b.jpg"));
-        // Plain Linux filenames with `?` must not be truncated.
         assert_eq!(
             CoverPaths::to_local_path(Some("/music/What?/01.flac")),
             Some(PathBuf::from("/music/What?/01.flac"))
         );
         let url = CoverPaths::to_file_url(Path::new("/home/okarin/My Covers/a #1?.jpg"));
-        assert_eq!(
-            url,
-            "file:///home/okarin/My%20Covers/a%20%231%3F.jpg"
-        );
+        assert_eq!(url, "file:///home/okarin/My%20Covers/a%20%231%3F.jpg");
         assert_eq!(
             CoverPaths::to_local_path(Some(&url)),
             Some(PathBuf::from("/home/okarin/My Covers/a #1?.jpg"))

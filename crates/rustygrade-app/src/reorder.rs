@@ -30,7 +30,8 @@ use iced::advanced::renderer::{self, Quad};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, overlay};
 use iced::{
-    Background, Border, Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, window,
+    Background, Border, Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard,
+    mouse, window,
 };
 
 /// Gap between rows (the page's track column spacing).
@@ -51,9 +52,152 @@ const ECO_STEP: Duration = Duration::from_millis(100);
 /// A row is lifted somewhere: the smooth-scroll wrapper then keeps the real pointer flowing to
 /// the list while it glides, so the lifted row follows the hand.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set on left press over an inner non-draggable control (`heart`, `more`) so holding it down
+/// does not arm drag-reorder.
+static PRESS_ON_ACTION: AtomicBool = AtomicBool::new(false);
 
 pub fn dragging() -> bool {
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Wraps an inner clickable control (`heart`, overflow button) inside a reorderable track row so
+/// holding down on it does not start a drag-reorder hold timer.
+pub(crate) fn no_drag<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(NoDrag {
+        content: content.into(),
+    })
+}
+
+struct NoDrag<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+impl<Message> Widget<Message, iced::Theme, iced::Renderer> for NoDrag<'_, Message> {
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        ) && cursor.is_over(layout.bounds())
+        {
+            PRESS_ON_ACTION.store(true, Ordering::Relaxed);
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 /// A drop: `Some((from, to))`, or `None` when the row went back to its place.
@@ -78,7 +222,14 @@ pub fn list<'a, Message: 'a>(
     accent: Color,
     callbacks: Callbacks<'a, Message>,
 ) -> Element<'a, Message> {
-    Element::new(Reorder { rows, offset, total, ghost, accent, callbacks })
+    Element::new(Reorder {
+        rows,
+        offset,
+        total,
+        ghost,
+        accent,
+        callbacks,
+    })
 }
 
 struct Reorder<'a, Message> {
@@ -127,6 +278,14 @@ struct State {
     slides: HashMap<usize, Slide>,
     /// RETRO_SHOT harness: the fake pointer (list coordinates) that replaces the real one.
     dev_cursor: Option<Point>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if self.drag.is_some() {
+            ACTIVE.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Developer hook for the RETRO_SHOT harness (no input device needed): press a row, move the
@@ -183,16 +342,32 @@ impl<Message> Reorder<'_, Message> {
     }
 
     /// Where row `index` is drawn now: its slide, or its resting place for `drag`.
-    fn offset_now(slides: &HashMap<usize, Slide>, drag: &Drag, index: usize, stride: f32, now: Instant) -> f32 {
+    fn offset_now(
+        slides: &HashMap<usize, Slide>,
+        drag: &Drag,
+        index: usize,
+        stride: f32,
+        now: Instant,
+    ) -> f32 {
         match slides.get(&index) {
-            Some(s) => motion::lerp(s.from, s.to, motion::progress(s.start, now, SLIDE, motion::Ease::CubicOut)),
+            Some(s) => motion::lerp(
+                s.from,
+                s.to,
+                motion::progress(s.start, now, SLIDE, motion::Ease::CubicOut),
+            ),
             None => Self::shift(drag, index, stride),
         }
     }
 
     /// The drop slot moved: rows between the old and new slot start sliding from where they are
     /// drawn now (or jump, with animations off).
-    fn retarget(slides: &mut HashMap<usize, Slide>, drag: &mut Drag, target: usize, stride: f32, now: Instant) {
+    fn retarget(
+        slides: &mut HashMap<usize, Slide>,
+        drag: &mut Drag,
+        target: usize,
+        stride: f32,
+        now: Instant,
+    ) {
         if target == drag.target {
             return;
         }
@@ -211,7 +386,14 @@ impl<Message> Reorder<'_, Message> {
             let from = Self::offset_now(slides, &old, index, stride, now);
             let to = Self::shift(drag, index, stride);
             if (from - to).abs() > 0.01 {
-                slides.insert(index, Slide { from, to, start: now });
+                slides.insert(
+                    index,
+                    Slide {
+                        from,
+                        to,
+                        start: now,
+                    },
+                );
             } else {
                 slides.remove(&index);
             }
@@ -245,7 +427,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
     }
 
     fn children(&self) -> Vec<Tree> {
-        self.rows.iter().chain(self.ghost.iter()).map(Tree::new).collect()
+        self.rows
+            .iter()
+            .chain(self.ghost.iter())
+            .map(Tree::new)
+            .collect()
     }
 
     fn diff(&self, tree: &mut Tree) {
@@ -253,7 +439,12 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
         tree.diff_children(&all);
     }
 
-    fn layout(&mut self, tree: &mut Tree, renderer: &iced::Renderer, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         let width = limits.width(Length::Fill).max().width;
         let child_limits = layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY));
         let mut nodes = Vec::with_capacity(self.rows.len() + 1);
@@ -283,8 +474,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
     ) {
         operation.container(None, layout.bounds());
         operation.traverse(&mut |operation| {
-            for ((row, state), layout) in self.rows.iter_mut().zip(&mut tree.children).zip(layout.children()) {
-                row.as_widget_mut().operate(state, layout, renderer, operation);
+            for ((row, state), layout) in self
+                .rows
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                row.as_widget_mut()
+                    .operate(state, layout, renderer, operation);
             }
         });
     }
@@ -308,12 +505,20 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
             let st = tree.state.downcast_mut::<State>();
             let (point, synthetic) = match act {
                 dev::Act::Press(i) => (
-                    Point::new(layout.bounds().center_x(), self.origin_y(layout, stride) + i as f32 * stride + h / 2.0),
+                    Point::new(
+                        layout.bounds().center_x(),
+                        self.origin_y(layout, stride) + i as f32 * stride + h / 2.0,
+                    ),
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                 ),
                 dev::Act::Move(dy) => {
                     let p = st.dev_cursor.unwrap_or_default();
-                    (Point::new(p.x, p.y + dy), Event::Mouse(mouse::Event::CursorMoved { position: Point::new(p.x, p.y + dy) }))
+                    (
+                        Point::new(p.x, p.y + dy),
+                        Event::Mouse(mouse::Event::CursorMoved {
+                            position: Point::new(p.x, p.y + dy),
+                        }),
+                    )
                 }
                 dev::Act::Release => (
                     st.dev_cursor.unwrap_or_default(),
@@ -322,7 +527,16 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
             };
             st.dev_cursor = Some(point);
             let release = matches!(act, dev::Act::Release);
-            self.update(tree, &synthetic, layout, mouse::Cursor::Available(point), renderer, clipboard, shell, viewport);
+            self.update(
+                tree,
+                &synthetic,
+                layout,
+                mouse::Cursor::Available(point),
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
             if release {
                 tree.state.downcast_mut::<State>().dev_cursor = None;
             }
@@ -374,36 +588,58 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
                     shell.capture_event();
                     return;
                 }
+                Event::Window(window::Event::Unfocused) => {
+                    state.drag = None;
+                    state.slides.clear();
+                    ACTIVE.store(false, Ordering::Relaxed);
+                    shell.publish((self.callbacks.on_drop)(None));
+                    shell.request_redraw();
+                    return;
+                }
                 Event::Window(window::Event::RedrawRequested(now)) => {
                     let top = viewport.y + EDGE;
                     let bottom = viewport.y + viewport.height - EDGE;
-                    let push = if drag.y < top {
+                    let can_up = layout.bounds().y < viewport.y - 0.5;
+                    let can_down = layout.bounds().y + layout.bounds().height
+                        > viewport.y + viewport.height + 0.5;
+                    let raw_push = if drag.y < top {
                         -((top - drag.y) / EDGE).min(1.0)
                     } else if drag.y > bottom {
                         ((drag.y - bottom) / EDGE).min(1.0)
                     } else {
                         0.0
                     };
+                    let push = if (raw_push < 0.0 && !can_up) || (raw_push > 0.0 && !can_down) {
+                        0.0
+                    } else {
+                        raw_push
+                    };
                     if push == 0.0 {
                         drag.last_frame = None;
                     } else if motion::enabled() {
-                        let dt = drag
-                            .last_frame
-                            .map_or(1.0 / 60.0, |t| now.saturating_duration_since(t).as_secs_f32().min(0.05));
+                        let dt = drag.last_frame.map_or(1.0 / 60.0, |t| {
+                            now.saturating_duration_since(t).as_secs_f32().min(0.05)
+                        });
                         drag.last_frame = Some(*now);
                         shell.publish((self.callbacks.on_edge)(push * EDGE_SPEED * dt));
                         shell.request_redraw_at(*now + motion::FRAME);
                     } else {
                         // Animations off: a step every ECO_STEP instead of a 60 FPS frame stream.
-                        let due = drag.last_frame.is_none_or(|t| now.saturating_duration_since(t) >= ECO_STEP);
+                        let due = drag
+                            .last_frame
+                            .is_none_or(|t| now.saturating_duration_since(t) >= ECO_STEP);
                         if due {
                             drag.last_frame = Some(*now);
-                            shell.publish((self.callbacks.on_edge)(push * EDGE_SPEED * ECO_STEP.as_secs_f32()));
+                            shell.publish((self.callbacks.on_edge)(
+                                push * EDGE_SPEED * ECO_STEP.as_secs_f32(),
+                            ));
                         }
                         shell.request_redraw_at(drag.last_frame.unwrap_or(*now) + ECO_STEP);
                     }
                     if motion::enabled() {
-                        state.slides.retain(|_, s| now.saturating_duration_since(s.start) < SLIDE);
+                        state
+                            .slides
+                            .retain(|_, s| now.saturating_duration_since(s.start) < SLIDE);
                         if !state.slides.is_empty() {
                             shell.request_redraw_at(*now + motion::FRAME);
                         }
@@ -417,21 +653,49 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
             return;
         }
 
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                state.press = None;
-                if let Some(p) = cursor.position()
-                    && let Some((i, row)) = layout.children().take(n).enumerate().find(|(_, r)| r.bounds().contains(p))
-                {
-                    let at = Instant::now();
-                    state.press = Some(Press { index: self.offset + i, origin: p, at, grab: p.y - row.bounds().y });
-                    shell.request_redraw_at(at + HOLD);
-                }
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+            let captured_before = shell.is_event_captured();
+            PRESS_ON_ACTION.store(false, Ordering::Relaxed);
+            for ((row, st), l) in self
+                .rows
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                row.as_widget_mut()
+                    .update(st, event, l, cursor, renderer, clipboard, shell, viewport);
             }
-            Event::Mouse(mouse::Event::ButtonReleased(_)) => state.press = None,
+            let on_action = PRESS_ON_ACTION.swap(false, Ordering::Relaxed);
+            state.press = None;
+            if !captured_before
+                && !on_action
+                && let Some(p) = cursor.position()
+                && let Some((i, row)) = layout
+                    .children()
+                    .take(n)
+                    .enumerate()
+                    .find(|(_, r)| r.bounds().contains(p))
+            {
+                let at = Instant::now();
+                state.press = Some(Press {
+                    index: self.offset + i,
+                    origin: p,
+                    at,
+                    grab: p.y - row.bounds().y,
+                });
+                shell.request_redraw_at(at + HOLD);
+            }
+            return;
+        }
+
+        match event {
+            Event::Mouse(mouse::Event::ButtonReleased(_))
+            | Event::Window(window::Event::Unfocused) => state.press = None,
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if let Some(press) = state.press
-                    && cursor.position().is_none_or(|p| p.distance(press.origin) > SLOP)
+                    && cursor
+                        .position()
+                        .is_none_or(|p| p.distance(press.origin) > SLOP)
                 {
                     state.press = None;
                 }
@@ -454,8 +718,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
                         state.slides.clear();
                         ACTIVE.store(true, Ordering::Relaxed);
                         // Reset the pressed row without playing it.
-                        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
-                        for ((row, st), l) in self.rows.iter_mut().zip(&mut tree.children).zip(layout.children()) {
+                        let release =
+                            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+                        for ((row, st), l) in self
+                            .rows
+                            .iter_mut()
+                            .zip(&mut tree.children)
+                            .zip(layout.children())
+                        {
                             row.as_widget_mut().update(
                                 st,
                                 &release,
@@ -477,8 +747,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
             _ => {}
         }
 
-        for ((row, st), l) in self.rows.iter_mut().zip(&mut tree.children).zip(layout.children()) {
-            row.as_widget_mut().update(st, event, l, cursor, renderer, clipboard, shell, viewport);
+        for ((row, st), l) in self
+            .rows
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            row.as_widget_mut()
+                .update(st, event, l, cursor, renderer, clipboard, shell, viewport);
         }
     }
 
@@ -497,7 +773,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
             .iter()
             .zip(&tree.children)
             .zip(layout.children())
-            .map(|((row, st), l)| row.as_widget().mouse_interaction(st, l, cursor, viewport, renderer))
+            .map(|((row, st), l)| {
+                row.as_widget()
+                    .mouse_interaction(st, l, cursor, viewport, renderer)
+            })
             .max()
             .unwrap_or_default()
     }
@@ -518,7 +797,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
         let Some(drag) = state.drag else {
             for ((row, st), l) in self.rows.iter().zip(&tree.children).zip(layout.children()) {
                 if l.bounds().intersects(viewport) {
-                    row.as_widget().draw(st, renderer, theme, style, l, cursor, viewport);
+                    row.as_widget()
+                        .draw(st, renderer, theme, style, l, cursor, viewport);
                 }
             }
             return;
@@ -527,7 +807,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
         let h = self.row_height(layout);
         let stride = h + SPACING;
         let now = Instant::now();
-        for (i, ((row, st), l)) in self.rows.iter().zip(&tree.children).zip(layout.children()).enumerate() {
+        for (i, ((row, st), l)) in self
+            .rows
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .enumerate()
+        {
             let index = self.offset + i;
             if index == drag.from {
                 continue;
@@ -538,7 +824,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
                 continue;
             }
             renderer.with_translation(Vector::new(0.0, dy), |r| {
-                row.as_widget().draw(st, r, theme, style, l, mouse::Cursor::Unavailable, viewport);
+                row.as_widget()
+                    .draw(st, r, theme, style, l, mouse::Cursor::Unavailable, viewport);
             });
         }
 
@@ -547,15 +834,32 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
         let bounds = layout.bounds();
         renderer.fill_quad(
             Quad {
-                bounds: Rectangle { x: bounds.x, y: slot_y, width: bounds.width, height: h },
-                border: Border { color: Color { a: 0.35, ..self.accent }, width: 1.0, radius: 0.0.into() },
+                bounds: Rectangle {
+                    x: bounds.x,
+                    y: slot_y,
+                    width: bounds.width,
+                    height: h,
+                },
+                border: Border {
+                    color: Color {
+                        a: 0.35,
+                        ..self.accent
+                    },
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
                 ..Quad::default()
             },
-            Background::Color(Color { a: 0.06, ..self.accent }),
+            Background::Color(Color {
+                a: 0.06,
+                ..self.accent
+            }),
         );
 
         // The lifted copy, above everything in the list.
-        if let (Some(ghost), Some(st), Some(gl)) = (&self.ghost, tree.children.get(n), layout.children().nth(n)) {
+        if let (Some(ghost), Some(st), Some(gl)) =
+            (&self.ghost, tree.children.get(n), layout.children().nth(n))
+        {
             let top = drag.y - drag.grab;
             let offset = Vector::new(bounds.x - gl.bounds().x, top - gl.bounds().y);
             renderer.with_layer(*viewport, |r| {
@@ -564,7 +868,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
                     r.fill_quad(
                         Quad {
                             bounds: b,
-                            border: Border { color: self.accent, width: 1.0, radius: 0.0.into() },
+                            border: Border {
+                                color: self.accent,
+                                width: 1.0,
+                                radius: 0.0.into(),
+                            },
                             shadow: iced::Shadow {
                                 color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
                                 offset: Vector::new(0.0, 6.0),
@@ -574,7 +882,15 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
                         },
                         Background::Color(crate::theme::HOVER),
                     );
-                    ghost.as_widget().draw(st, r, theme, style, gl, mouse::Cursor::Unavailable, viewport);
+                    ghost.as_widget().draw(
+                        st,
+                        r,
+                        theme,
+                        style,
+                        gl,
+                        mouse::Cursor::Unavailable,
+                        viewport,
+                    );
                 });
             });
         }
@@ -588,7 +904,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Reorder<'_, Messa
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
-        overlay::from_children(&mut self.rows, tree, layout, renderer, viewport, translation)
+        overlay::from_children(
+            &mut self.rows,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 
@@ -607,7 +930,14 @@ mod tests {
     use super::*;
 
     fn drag(from: usize, target: usize) -> Drag {
-        Drag { from, grab: 0.0, y: 0.0, rel_y: 0.0, target, last_frame: None }
+        Drag {
+            from,
+            grab: 0.0,
+            y: 0.0,
+            rel_y: 0.0,
+            target,
+            last_frame: None,
+        }
     }
 
     #[test]

@@ -23,21 +23,17 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, overlay};
 use iced::{Element, Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, window};
 
-/// Pixels per wheel notch (Chromium on Windows: ~100 CSS px), as in the C# build.
-pub const STEP: f32 = 100.0;
-/// Share of the remaining distance closed per second (Lenis' 0.1 per 60 Hz frame is ~6.3/s;
-/// slightly firmer, so a long library never feels sluggish).
-pub const LAMBDA: f32 = 8.5;
-/// Close enough: snap and stop.
-pub const SETTLE_PX: f32 = 0.5;
-/// The offset was moved by something else (scrollbar drag, keyboard, a programmatic jump).
-pub const TAKEOVER_PX: f32 = 2.0;
-/// Longest frame step used for the smoothing, so a stalled frame does not teleport the list.
+const STEP: f32 = 100.0;
+const LAMBDA: f32 = 8.5;
+const SETTLE_PX: f32 = 0.5;
+const TAKEOVER_PX: f32 = 2.0;
 const MAX_DT: f32 = 0.1;
 
 /// Wraps `content` (a vertical `scrollable`, possibly inside containers) with smooth wheel scrolling.
 pub fn smooth<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    Element::new(SmoothWheel { content: content.into() })
+    Element::new(SmoothWheel {
+        content: content.into(),
+    })
 }
 
 struct SmoothWheel<'a, Message> {
@@ -100,7 +96,12 @@ pub mod dev {
         static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
         let file = FILE.get_or_init(|| {
             let path = std::env::var_os("RETRO_SCROLL_LOG")?;
-            std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
         });
         if let Some(f) = file
             && let Ok(mut f) = f.lock()
@@ -121,20 +122,18 @@ pub fn step(current: f32, target: f32, dt: f32) -> f32 {
 }
 
 /// The geometry of the first scrollable under the wrapper, plus whether the pointer is over a
-/// nested scrollable that can still scroll (which then keeps the wheel, as in the C# build).
+/// nested scrollable that still has headroom in the wheel direction.
 #[derive(Default)]
 struct Probe {
     cursor: Option<Point>,
+    wheel_up: Option<bool>,
     found: Option<(f32, f32)>, // (offset y, max offset y)
-    /// Translation of the outer list, to bring layout bounds of nested lists to screen space.
     outer_translation: Vector,
     nested_wants_wheel: bool,
-    set_to: Option<f32>,
 }
 
 impl Operation for Probe {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-        // Nested lists only matter for a wheel event; a frame only needs the outer list.
         if self.found.is_some() && (self.cursor.is_none() || self.nested_wants_wheel) {
             return;
         }
@@ -147,15 +146,12 @@ impl Operation for Probe {
         bounds: Rectangle,
         content_bounds: Rectangle,
         translation: Vector,
-        state: &mut dyn Scrollable,
+        _state: &mut dyn Scrollable,
     ) {
         if self.found.is_none() {
             let max = (content_bounds.height - bounds.height).max(0.0);
             self.found = Some((translation.y, max));
             self.outer_translation = translation;
-            if let Some(y) = self.set_to {
-                state.scroll_to(AbsoluteOffset { x: None, y: Some(y.clamp(0.0, max)) });
-            }
             return;
         }
         if let Some(cursor) = self.cursor {
@@ -164,16 +160,81 @@ impl Operation for Probe {
                 y: bounds.y - self.outer_translation.y,
                 ..bounds
             };
-            if on_screen.contains(cursor) && content_bounds.height > bounds.height + 0.5 {
+            let nested_max = (content_bounds.height - bounds.height).max(0.0);
+            let can_scroll = match self.wheel_up {
+                Some(true) => translation.y > 0.5,
+                Some(false) => translation.y < nested_max - 0.5,
+                None => nested_max > 0.5,
+            };
+            if on_screen.contains(cursor) && can_scroll {
                 self.nested_wants_wheel = true;
             }
         }
     }
 }
 
+/// Single-pass `Operation` that advances and commits the active glide on the outer scrollable.
+struct FrameStep<'a> {
+    now: Instant,
+    glide: &'a mut Glide,
+    done: bool,
+    stepped: bool,
+}
+
+impl Operation for FrameStep<'_> {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        if !self.stepped {
+            operate(self);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&iced::advanced::widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        state: &mut dyn Scrollable,
+    ) {
+        if self.stepped {
+            return;
+        }
+        self.stepped = true;
+        let offset = translation.y;
+        let max = (content_bounds.height - bounds.height).max(0.0);
+        if (offset - self.glide.current).abs() > TAKEOVER_PX {
+            self.done = true;
+            return;
+        }
+        self.glide.target = self.glide.target.clamp(0.0, max);
+        let y = if !crate::motion::enabled() {
+            self.glide.target
+        } else {
+            let dt = self.glide.last_frame.map_or(1.0 / 60.0, |last| {
+                self.now.saturating_duration_since(last).as_secs_f32()
+            });
+            self.glide.last_frame = Some(self.now);
+            step(self.glide.current, self.glide.target, dt)
+        };
+        self.glide.current = y;
+        if let Some(start) = self.glide.started {
+            dev::log(
+                self.now.saturating_duration_since(start).as_secs_f32() * 1000.0,
+                y,
+                self.glide.target,
+            );
+        }
+        state.scroll_to(AbsoluteOffset {
+            x: None,
+            y: Some(y.clamp(0.0, max)),
+        });
+        self.done = y == self.glide.target;
+    }
+}
+
 impl<Message> SmoothWheel<'_, Message> {
     /// Moves the glide target by `notches` (positive = up, as wheel deltas). Returns `false` when the
-    /// wheel belongs to someone else: no list, nothing to scroll, or a nested list under the pointer.
+    /// wheel belongs to someone else or when already at the limit in that direction.
     fn wheel(
         &mut self,
         tree: &mut Tree,
@@ -182,14 +243,20 @@ impl<Message> SmoothWheel<'_, Message> {
         notches: f32,
         cursor: Option<Point>,
     ) -> bool {
-        let probe = self.probe(tree, layout, renderer, cursor, None);
-        let Some((offset, max)) = probe.found else { return false };
+        let probe = self.probe(tree, layout, renderer, cursor, Some(notches > 0.0));
+        let Some((offset, max)) = probe.found else {
+            return false;
+        };
         if max <= 0.0 || probe.nested_wants_wheel {
             return false;
         }
         let glide = tree.state.downcast_mut::<Glide>();
         let from = if glide.running { glide.target } else { offset };
-        glide.target = (from - notches * STEP).clamp(0.0, max);
+        let next_target = (from - notches * STEP).clamp(0.0, max);
+        if !glide.running && (next_target - offset).abs() <= SETTLE_PX {
+            return false;
+        }
+        glide.target = next_target;
         if !glide.running {
             glide.running = true;
             glide.current = offset;
@@ -205,9 +272,13 @@ impl<Message> SmoothWheel<'_, Message> {
         layout: Layout<'_>,
         renderer: &iced::Renderer,
         cursor: Option<Point>,
-        set_to: Option<f32>,
+        wheel_up: Option<bool>,
     ) -> Probe {
-        let mut probe = Probe { cursor, set_to, ..Probe::default() };
+        let mut probe = Probe {
+            cursor,
+            wheel_up,
+            ..Probe::default()
+        };
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, &mut probe);
@@ -246,7 +317,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
     }
 
     fn operate(
@@ -272,14 +345,21 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Keyboard(keyboard::Event::ModifiersChanged(m)) = event {
-            tree.state.downcast_mut::<Glide>().modifiers = *m;
+        match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                tree.state.downcast_mut::<Glide>().modifiers = *m;
+            }
+            Event::Window(window::Event::Unfocused) => {
+                tree.state.downcast_mut::<Glide>().modifiers = keyboard::Modifiers::default();
+            }
+            _ => {}
         }
         // A press anywhere ends the glide, as in Lenis and Chromium: a scrollbar grab or a drag then
         // gets the real pointer, and a glide never carries over to a list swapped in by a click or key.
         if matches!(
             event,
-            Event::Mouse(mouse::Event::ButtonPressed(_)) | Event::Keyboard(keyboard::Event::KeyPressed { .. })
+            Event::Mouse(mouse::Event::ButtonPressed(_))
+                | Event::Keyboard(keyboard::Event::KeyPressed { .. })
         ) {
             let glide = tree.state.downcast_mut::<Glide>();
             glide.running = false;
@@ -311,32 +391,21 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
 
         let running = tree.state.downcast_ref::<Glide>().running;
         if running && let Event::Window(window::Event::RedrawRequested(now)) = event {
-            let probe = self.probe(tree, layout, renderer, None, None);
-            let glide = tree.state.downcast_mut::<Glide>();
-            let finished = match probe.found {
-                // Something else moved the list (scrollbar drag, keyboard, a jump): give way to it.
-                Some((offset, _)) if (offset - glide.current).abs() > TAKEOVER_PX => true,
-                Some((_, max)) => {
-                    // Lists that re-measure while scrolling can move their end.
-                    glide.target = glide.target.clamp(0.0, max);
-                    let y = if !crate::motion::enabled() {
-                        glide.target
-                    } else {
-                        let dt = glide
-                            .last_frame
-                            .map_or(1.0 / 60.0, |last| now.saturating_duration_since(last).as_secs_f32());
-                        glide.last_frame = Some(*now);
-                        step(glide.current, glide.target, dt)
-                    };
-                    glide.current = y;
-                    if let Some(start) = glide.started {
-                        dev::log(now.saturating_duration_since(start).as_secs_f32() * 1000.0, y, glide.target);
-                    }
-                    let done = y == glide.target;
-                    self.probe(tree, layout, renderer, None, Some(y));
-                    done
-                }
-                None => true,
+            let finished = {
+                let glide = tree.state.downcast_mut::<Glide>();
+                let mut frame_step = FrameStep {
+                    now: *now,
+                    glide,
+                    done: true,
+                    stepped: false,
+                };
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut frame_step,
+                );
+                frame_step.done
             };
             let glide = tree.state.downcast_mut::<Glide>();
             if finished {
@@ -348,7 +417,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
             // The list is redrawn under a hidden pointer while it glides; once it settles, a
             // pointer move brings hover back where the pointer actually is.
             // A row held for reordering keeps the real pointer, so it stays under the hand.
-            let child_cursor = if finished || crate::reorder::dragging() { cursor } else { mouse::Cursor::Unavailable };
+            let child_cursor = if finished || crate::reorder::dragging() {
+                cursor
+            } else {
+                mouse::Cursor::Unavailable
+            };
             self.content.as_widget_mut().update(
                 &mut tree.children[0],
                 event,
@@ -381,7 +454,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
             &mut tree.children[0],
             event,
             layout,
-            if hide_hover { mouse::Cursor::Unavailable } else { cursor },
+            if hide_hover {
+                mouse::Cursor::Unavailable
+            } else {
+                cursor
+            },
             renderer,
             clipboard,
             shell,
@@ -397,9 +474,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn draw(
@@ -412,14 +493,20 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let cursor = if tree.state.downcast_ref::<Glide>().running {
+        let cursor = if tree.state.downcast_ref::<Glide>().running && !crate::reorder::dragging() {
             mouse::Cursor::Unavailable
         } else {
             cursor
         };
-        self.content
-            .as_widget()
-            .draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
     }
 
     fn overlay<'b>(
@@ -430,9 +517,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for SmoothWheel<'_, M
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
-        self.content
-            .as_widget_mut()
-            .overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 

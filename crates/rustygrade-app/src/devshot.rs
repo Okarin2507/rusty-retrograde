@@ -32,19 +32,27 @@ impl Plan {
 }
 
 fn after(ms: u64, msg: Message) -> Task<Message> {
-    Task::perform(tokio::time::sleep(Duration::from_millis(ms)), move |_| msg.clone())
+    Task::perform(tokio::time::sleep(Duration::from_millis(ms)), move |_| msg)
 }
 
 impl App {
     /// Called when the main window has opened.
     pub fn shot_begin(&self) -> Task<Message> {
-        if self.shot.is_some() { after(6000, Message::ShotStep(0)) } else { Task::none() }
+        if self.shot.is_some() {
+            after(6000, Message::ShotStep(0))
+        } else {
+            Task::none()
+        }
     }
 
     /// Puts the app into the state the step names, then waits for it to be drawn before the picture is taken.
     pub fn shot_step(&mut self, i: usize) -> Task<Message> {
-        let Some(plan) = self.shot.clone() else { return Task::none() };
-        let Some(raw) = plan.steps.get(i) else { return iced::exit() };
+        let Some(plan) = self.shot.clone() else {
+            return Task::none();
+        };
+        let Some(raw) = plan.steps.get(i) else {
+            return iced::exit();
+        };
         // "name@ms": take the picture ms after the change instead of waiting for it to settle
         let (step, delay) = match raw.split_once('@') {
             Some((n, ms)) => (n.to_owned(), ms.parse().unwrap_or(2200)),
@@ -118,6 +126,7 @@ impl App {
                 self.tag_status = None;
                 self.create_playlist_open = false;
                 self.show_shortcuts_modal = false;
+                self.end_cover_fetches();
                 go(Message::CloseEgg);
             }
             "tagalbum" => {
@@ -260,14 +269,19 @@ impl App {
     pub fn shot_go(&self, i: usize) -> Task<Message> {
         match self.main_window.or(self.mini_window) {
             Some(id) => window::screenshot(id).map(move |s| Message::ShotTaken(i, s)),
-            None => Task::none(),
+            None => after(100, Message::ShotStep(i + 1)),
         }
     }
 
     pub fn shot_taken(&mut self, i: usize, shot: window::Screenshot) -> Task<Message> {
         if let Some(plan) = &self.shot {
-            let name = plan.steps.get(i).map_or("?", String::as_str);
-            if let Some(img) = image::RgbaImage::from_raw(shot.size.width, shot.size.height, shot.rgba.to_vec()) {
+            let name = plan
+                .steps
+                .get(i)
+                .map_or("?", |s| s.split_once('@').map_or(s.as_str(), |(n, _)| n));
+            if let Some(img) =
+                image::RgbaImage::from_raw(shot.size.width, shot.size.height, shot.rgba.to_vec())
+            {
                 let _ = img.save(plan.dir.join(format!("{i}-{name}.png")));
             }
         }

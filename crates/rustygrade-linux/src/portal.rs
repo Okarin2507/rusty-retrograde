@@ -1,11 +1,22 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "portal")]
+fn filter_with_globs(label: &str, exts: &[&str]) -> ashpd::desktop::file_chooser::FileFilter {
+    let mut filter = ashpd::desktop::file_chooser::FileFilter::new(label);
+    for ext in exts {
+        filter = filter
+            .glob(&format!("*.{}", ext.to_ascii_lowercase()))
+            .glob(&format!("*.{}", ext.to_ascii_uppercase()));
+    }
+    filter
+}
+
 /// Opens a native Linux folder chooser via XDG Desktop Portal (`ashpd`) when enabled,
 /// keeping Wayland dialogs sandbox-compatible without GTK or X11 dependencies.
 #[cfg(feature = "portal")]
 pub async fn pick_music_folders() -> Result<Vec<PathBuf>, String> {
-    use ashpd::desktop::file_chooser::SelectedFiles;
     use ashpd::desktop::ResponseError;
+    use ashpd::desktop::file_chooser::SelectedFiles;
 
     let req = SelectedFiles::open_file()
         .title("Add Music Folders")
@@ -25,17 +36,14 @@ pub async fn pick_music_folders() -> Result<Vec<PathBuf>, String> {
 /// Opens a native Linux file chooser for audio tracks via XDG Desktop Portal.
 #[cfg(feature = "portal")]
 pub async fn pick_music_files() -> Result<Vec<PathBuf>, String> {
-    use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
     use ashpd::desktop::ResponseError;
+    use ashpd::desktop::file_chooser::SelectedFiles;
 
     const EXTS: &[&str] = &[
         "flac", "mp3", "wav", "ogg", "opus", "m4a", "aac", "wma", "aiff", "alac", "wv", "ape",
         "dsf", "dff",
     ];
-    let mut filter = FileFilter::new("Audio Files");
-    for ext in EXTS {
-        filter = filter.glob(&format!("*.{ext}"));
-    }
+    let filter = filter_with_globs("Audio Files", EXTS);
 
     let req = SelectedFiles::open_file()
         .title("Add Music Files")
@@ -55,14 +63,10 @@ pub async fn pick_music_files() -> Result<Vec<PathBuf>, String> {
 /// Opens a native Linux file chooser for a single cover image via XDG Desktop Portal.
 #[cfg(feature = "portal")]
 pub async fn pick_cover_image() -> Result<Option<PathBuf>, String> {
-    use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
     use ashpd::desktop::ResponseError;
+    use ashpd::desktop::file_chooser::SelectedFiles;
 
-    let filter = FileFilter::new("Images")
-        .glob("*.jpg")
-        .glob("*.jpeg")
-        .glob("*.png")
-        .glob("*.webp");
+    let filter = filter_with_globs("Images", &["jpg", "jpeg", "png", "webp"]);
 
     let req = SelectedFiles::open_file()
         .title("Choose Cover Image")
@@ -83,23 +87,11 @@ pub async fn pick_cover_image() -> Result<Option<PathBuf>, String> {
 #[cfg(feature = "portal")]
 pub async fn pick_playlist_import_file() -> Result<Option<PathBuf>, String> {
     use ashpd::desktop::ResponseError;
-    use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
+    use ashpd::desktop::file_chooser::SelectedFiles;
 
-    let all_supported = FileFilter::new("Playlists & Backups")
-        .glob("*.m3u8")
-        .glob("*.m3u")
-        .glob("*.zip")
-        .glob("*.M3U8")
-        .glob("*.M3U")
-        .glob("*.ZIP");
-    let m3u_only = FileFilter::new("M3U Playlists")
-        .glob("*.m3u8")
-        .glob("*.m3u")
-        .glob("*.M3U8")
-        .glob("*.M3U");
-    let zip_only = FileFilter::new("Retrograde Backups")
-        .glob("*.zip")
-        .glob("*.ZIP");
+    let all_supported = filter_with_globs("Playlists & Backups", &["m3u8", "m3u", "zip"]);
+    let m3u_only = filter_with_globs("M3U Playlists", &["m3u8", "m3u"]);
+    let zip_only = filter_with_globs("Retrograde Backups", &["zip"]);
 
     let req = SelectedFiles::open_file()
         .title("Import Playlist or Backup")
@@ -125,17 +117,13 @@ pub async fn pick_playlist_export_file(
     is_zip: bool,
 ) -> Result<Option<PathBuf>, String> {
     use ashpd::desktop::ResponseError;
-    use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
+    use ashpd::desktop::file_chooser::SelectedFiles;
 
     let make_filter = || {
         if is_zip {
-            FileFilter::new("Retrograde Backup Archive (*.zip)")
-                .glob("*.zip")
-                .glob("*.ZIP")
+            filter_with_globs("Retrograde Backup Archive (*.zip)", &["zip"])
         } else {
-            FileFilter::new("Extended M3U8 Playlist (*.m3u8)")
-                .glob("*.m3u8")
-                .glob("*.M3U8")
+            filter_with_globs("Extended M3U8 Playlist (*.m3u8)", &["m3u8"])
         }
     };
 
@@ -158,7 +146,14 @@ pub async fn pick_playlist_export_file(
         Ok(response) => Ok(uris_to_local_paths(response.uris())
             .into_iter()
             .next()
-            .map(|p| avoid_overwrite(ensure_export_extension(p, is_zip), is_zip))),
+            .map(|p| {
+                let (path, appended) = ensure_export_extension(p, is_zip);
+                if appended {
+                    avoid_overwrite(path)
+                } else {
+                    path
+                }
+            })),
         Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(None),
         Err(e) => Err(format!("Export destination selection failed: {e}")),
     }
@@ -180,11 +175,12 @@ fn is_document_portal_path(path: &std::path::Path) -> bool {
     )
 }
 
+/// Ensures an export path ends with a supported extension unless it came from the document portal,
+/// returning `(path, appended)` so callers only avoid overwrites when we synthesized a new filename.
 #[cfg(any(feature = "portal", test))]
-fn ensure_export_extension(path: PathBuf, is_zip: bool) -> PathBuf {
-    // Sandboxed XDG Document Portal grants write access only to the exact path returned.
+fn ensure_export_extension(path: PathBuf, is_zip: bool) -> (PathBuf, bool) {
     if is_document_portal_path(&path) {
-        return path;
+        return (path, false);
     }
     let ext = path.extension().and_then(|e| e.to_str());
     let has_valid = if is_zip {
@@ -193,24 +189,36 @@ fn ensure_export_extension(path: PathBuf, is_zip: bool) -> PathBuf {
         ext.is_some_and(|e| e.eq_ignore_ascii_case("m3u8") || e.eq_ignore_ascii_case("m3u"))
     };
     if has_valid {
-        return path;
+        return (path, false);
     }
     let mut os = path.into_os_string();
     os.push(if is_zip { ".zip" } else { ".m3u8" });
-    PathBuf::from(os)
+    (PathBuf::from(os), true)
 }
 
 /// The portal only confirmed the name the user typed; if we appended an extension and that
 /// file already exists, pick a free `name (n).ext` rather than silently overwriting it.
 #[cfg(any(feature = "portal", test))]
-fn avoid_overwrite(path: PathBuf, _is_zip: bool) -> PathBuf {
+fn avoid_overwrite(path: PathBuf) -> PathBuf {
     if is_document_portal_path(&path) || !path.exists() {
         return path;
     }
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("export").to_owned();
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_owned();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("export")
+        .to_owned();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
     for n in 1..1000 {
-        let name = if ext.is_empty() { format!("{stem} ({n})") } else { format!("{stem} ({n}).{ext}") };
+        let name = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
         let cand = path.with_file_name(name);
         if !cand.exists() {
             return cand;
@@ -263,41 +271,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn avoid_overwrite_picks_free_name() {
+    fn export_extension_and_overwrite_handling() {
         let dir = std::env::temp_dir().join(format!("rg-ovw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("mix.m3u8");
-        assert_eq!(avoid_overwrite(p.clone(), false), p);
+        assert_eq!(avoid_overwrite(p.clone()), p);
         std::fs::write(&p, b"x").unwrap();
-        assert_eq!(avoid_overwrite(p.clone(), false), dir.join("mix (1).m3u8"));
+        assert_eq!(avoid_overwrite(p.clone()), dir.join("mix (1).m3u8"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn ensure_export_extension_appends_when_missing_or_preserving_dots_but_skips_doc_portal() {
         assert_eq!(
             ensure_export_extension(PathBuf::from("/home/okarin/Music/mix"), false),
-            PathBuf::from("/home/okarin/Music/mix.m3u8")
+            (PathBuf::from("/home/okarin/Music/mix.m3u8"), true)
         );
         assert_eq!(
             ensure_export_extension(PathBuf::from("/home/okarin/Music/my.mix"), true),
-            PathBuf::from("/home/okarin/Music/my.mix.zip")
+            (PathBuf::from("/home/okarin/Music/my.mix.zip"), true)
         );
         assert_eq!(
             ensure_export_extension(PathBuf::from("/home/okarin/Music/MIX.M3U"), false),
-            PathBuf::from("/home/okarin/Music/MIX.M3U")
+            (PathBuf::from("/home/okarin/Music/MIX.M3U"), false)
         );
         assert_eq!(
             ensure_export_extension(PathBuf::from("/home/okarin/Music/backup.ZIP"), true),
-            PathBuf::from("/home/okarin/Music/backup.ZIP")
+            (PathBuf::from("/home/okarin/Music/backup.ZIP"), false)
         );
         assert_eq!(
             ensure_export_extension(PathBuf::from("/run/user/1000/doc/deadbeef/mix"), false),
-            PathBuf::from("/run/user/1000/doc/deadbeef/mix")
-        );
-        assert_eq!(
-            ensure_export_extension(PathBuf::from("/run/user/1000/doc/deadbeef/backup"), true),
-            PathBuf::from("/run/user/1000/doc/deadbeef/backup")
+            (PathBuf::from("/run/user/1000/doc/deadbeef/mix"), false)
         );
     }
 }

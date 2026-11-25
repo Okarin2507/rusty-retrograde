@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use thiserror::Error;
 use tracing::{debug, warn};
 use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::proxy::Builder as ProxyBuilder;
@@ -7,28 +8,17 @@ use zbus::proxy::Builder as ProxyBuilder;
 const PRIORITY: i32 = 100;
 
 /// Why the card could not be reserved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ReservationError {
     /// No session bus (or it failed): nobody can be asked, the card may still be free.
+    #[error("no session bus: {0}")]
     NoBus(String),
     /// The program holding the card said no (`ApplicationName` when it gives one).
+    #[error("held by {} which refused to release it", holder.as_deref().unwrap_or("another program"))]
     Refused { holder: Option<String> },
     /// The holder agreed but the name never came over.
+    #[error("timed out taking the card from PipeWire")]
     Timeout,
-}
-
-impl std::fmt::Display for ReservationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoBus(e) => write!(f, "no session bus: {e}"),
-            Self::Refused { holder } => write!(
-                f,
-                "held by {} which refused to release it",
-                holder.as_deref().unwrap_or("another program")
-            ),
-            Self::Timeout => f.write_str("timed out taking the card from PipeWire"),
-        }
-    }
 }
 
 struct ReserveDeviceObject {
@@ -107,19 +97,30 @@ impl DeviceReservation {
                 .build()
                 .await
         {
-            match holder.call::<_, _, bool>("RequestRelease", &(PRIORITY,)).await {
+            match holder
+                .call::<_, _, bool>("RequestRelease", &(PRIORITY,))
+                .await
+            {
                 Ok(false) => {
                     let holder = holder
                         .get_property::<String>("ApplicationName")
                         .await
                         .ok()
                         .filter(|n| !n.is_empty());
-                    warn!(card, bus_name, ?holder, "Current ReserveDevice1 holder refused RequestRelease(100)");
+                    warn!(
+                        card,
+                        bus_name,
+                        ?holder,
+                        "Current ReserveDevice1 holder refused RequestRelease(100)"
+                    );
                     let _ = conn.close().await;
                     return Err(ReservationError::Refused { holder });
                 }
                 Ok(true) => {
-                    debug!(card, "Current ReserveDevice1 holder agreed to release device");
+                    debug!(
+                        card,
+                        "Current ReserveDevice1 holder agreed to release device"
+                    );
                 }
                 Err(err) => {
                     debug!(card, error = %err, "RequestRelease call failed (holder may have vanished); attempting claim");
@@ -127,9 +128,11 @@ impl DeviceReservation {
             }
         }
 
-        let flags = RequestNameFlags::REPLACE_EXISTING | RequestNameFlags::DO_NOT_QUEUE;
+        let flags = RequestNameFlags::ALLOW_REPLACEMENT
+            | RequestNameFlags::REPLACE_EXISTING
+            | RequestNameFlags::DO_NOT_QUEUE;
         let mut acquired = false;
-        for _ in 0..20 {
+        for attempt in 0..20 {
             match conn.request_name_with_flags(bus_name.as_str(), flags).await {
                 Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {
                     acquired = true;
@@ -140,7 +143,9 @@ impl DeviceReservation {
                     warn!(card, error = %err, "ReserveDevice1 request_name attempt failed");
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if attempt + 1 < 20 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
 
         if !acquired {
@@ -154,10 +159,6 @@ impl DeviceReservation {
             bus_name,
             card,
         })
-    }
-
-    pub fn card(&self) -> i32 {
-        self.card
     }
 
     pub async fn release(self) {

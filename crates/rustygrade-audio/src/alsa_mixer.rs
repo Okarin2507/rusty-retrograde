@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use libloading::Library;
+use tracing::warn;
 
 const CANDIDATES: &[&str] = &[
     "Master",
@@ -18,7 +20,7 @@ const CANDIDATES: &[&str] = &[
 ];
 
 /// The `0.0..=1.0` knob maps linearly in dB over the top 60 dB (`6000` centi-dB) of the hardware control.
-pub const MAX_SPAN_CENTI_DB: i64 = 6000;
+const MAX_SPAN_CENTI_DB: i64 = 6000;
 
 struct AlsaVtable {
     _lib: Library,
@@ -93,49 +95,110 @@ fn vtable() -> Option<&'static AlsaVtable> {
         .as_ref()
 }
 
-pub struct AlsaMixer;
+struct MixerSession<'a> {
+    vt: &'a AlsaVtable,
+    mixer: *mut c_void,
+    id: *mut c_void,
+}
 
-impl AlsaMixer {
-    pub fn find_control(card: i32) -> Option<String> {
-        for &name in CANDIDATES {
-            if Self::with_elem(card, name, |_, _| true) {
-                return Some(name.to_owned());
+impl<'a> Drop for MixerSession<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.id.is_null() {
+                (self.vt.selem_id_free)(self.id);
+            }
+            if !self.mixer.is_null() {
+                (self.vt.mixer_close)(self.mixer);
             }
         }
-        Self::find_first_playback_volume_control(card)
     }
+}
 
-    fn find_first_playback_volume_control(card: i32) -> Option<String> {
+impl<'a> MixerSession<'a> {
+    fn open(card: i32, with_id: bool) -> Option<Self> {
         let vt = vtable()?;
         let hw_name = CString::new(format!("hw:{card}")).ok()?;
         unsafe {
-            struct MixerGuard<'a> {
-                vt: &'a AlsaVtable,
-                mixer: *mut c_void,
-            }
-            impl Drop for MixerGuard<'_> {
-                fn drop(&mut self) {
-                    if !self.mixer.is_null() {
-                        unsafe { (self.vt.mixer_close)(self.mixer) };
-                    }
-                }
-            }
-
+            let mut session = Self {
+                vt,
+                mixer: ptr::null_mut(),
+                id: ptr::null_mut(),
+            };
             let mut mixer: *mut c_void = ptr::null_mut();
             if (vt.mixer_open)(&raw mut mixer, 0) < 0 || mixer.is_null() {
                 return None;
             }
-            let guard = MixerGuard { vt, mixer };
-            if (vt.mixer_attach)(guard.mixer, hw_name.as_ptr()) < 0
-                || (vt.mixer_selem_register)(guard.mixer, ptr::null_mut(), ptr::null_mut()) < 0
-                || (vt.mixer_load)(guard.mixer) < 0
+            session.mixer = mixer;
+            if (vt.mixer_attach)(session.mixer, hw_name.as_ptr()) < 0
+                || (vt.mixer_selem_register)(session.mixer, ptr::null_mut(), ptr::null_mut()) < 0
+                || (vt.mixer_load)(session.mixer) < 0
             {
                 return None;
             }
-            let mut elem = (vt.first_elem)(guard.mixer);
+            if with_id {
+                let mut id: *mut c_void = ptr::null_mut();
+                if (vt.selem_id_malloc)(&raw mut id) < 0 || id.is_null() {
+                    return None;
+                }
+                session.id = id;
+            }
+            Some(session)
+        }
+    }
+
+    unsafe fn find_playback_vol_elem(&self, control: &str) -> Option<*mut c_void> {
+        let ctrl_name = CString::new(control).ok()?;
+        unsafe {
+            (self.vt.selem_id_set_index)(self.id, 0);
+            (self.vt.selem_id_set_name)(self.id, ctrl_name.as_ptr());
+            let elem = (self.vt.find_selem)(self.mixer, self.id);
+            if elem.is_null() || (self.vt.has_playback_volume)(elem) == 0 {
+                None
+            } else {
+                Some(elem)
+            }
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_cast)]
+unsafe fn write_elem_target(vt: &AlsaVtable, elem: *mut c_void, level_or_min: Option<f64>) -> bool {
+    unsafe {
+        let (mut min, mut max): (c_long, c_long) = (0, 0);
+        if (vt.get_playback_db_range)(elem, &raw mut min, &raw mut max) == 0 && max > min {
+            let db = match level_or_min {
+                Some(level) => level_to_db(min as i64, max as i64, level) as c_long,
+                None => min,
+            };
+            return (vt.set_playback_db_all)(elem, db, 0) >= 0;
+        }
+        let (mut rmin, mut rmax): (c_long, c_long) = (0, 0);
+        if (vt.get_playback_vol_range)(elem, &raw mut rmin, &raw mut rmax) == 0 && rmax > rmin {
+            let raw = match level_or_min {
+                Some(level) => level_to_raw(rmin as i64, rmax as i64, level) as c_long,
+                None => rmin,
+            };
+            return (vt.set_playback_vol_all)(elem, raw) >= 0;
+        }
+        false
+    }
+}
+
+pub struct AlsaMixer;
+
+impl AlsaMixer {
+    pub fn find_control(card: i32) -> Option<String> {
+        let session = MixerSession::open(card, true)?;
+        unsafe {
+            for &name in CANDIDATES {
+                if session.find_playback_vol_elem(name).is_some() {
+                    return Some(name.to_owned());
+                }
+            }
+            let mut elem = (session.vt.first_elem)(session.mixer);
             while !elem.is_null() {
-                if (vt.has_playback_volume)(elem) != 0 {
-                    let name_ptr = (vt.selem_get_name)(elem);
+                if (session.vt.has_playback_volume)(elem) != 0 {
+                    let name_ptr = (session.vt.selem_get_name)(elem);
                     if !name_ptr.is_null() {
                         let s = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
                         if !s.is_empty() {
@@ -143,10 +206,10 @@ impl AlsaMixer {
                         }
                     }
                 }
-                elem = (vt.elem_next)(elem);
+                elem = (session.vt.elem_next)(elem);
             }
-            None
         }
+        None
     }
 
     // c_long is i64 on x86_64/aarch64 but i32 on 32-bit Linux targets.
@@ -190,58 +253,20 @@ impl AlsaMixer {
         out
     }
 
-    #[allow(clippy::unnecessary_cast)]
     pub fn write_level(card: i32, control: &str, level: f64) -> bool {
-        let level = level.clamp(0.0, 1.0);
+        let level = sanitize_unit(level);
         Self::with_elem(card, control, |vt, elem| unsafe {
-            let (mut min, mut max): (c_long, c_long) = (0, 0);
-            if (vt.get_playback_db_range)(elem, &raw mut min, &raw mut max) == 0 && max > min {
-                let db = level_to_db(min as i64, max as i64, level);
-                return (vt.set_playback_db_all)(elem, db as c_long, 0) >= 0;
-            }
-            let (mut rmin, mut rmax): (c_long, c_long) = (0, 0);
-            if (vt.get_playback_vol_range)(elem, &raw mut rmin, &raw mut rmax) == 0 && rmax > rmin {
-                let raw = level_to_raw(rmin as i64, rmax as i64, level);
-                return (vt.set_playback_vol_all)(elem, raw as c_long) >= 0;
-            }
-            false
+            write_elem_target(vt, elem, Some(level))
         })
     }
 
-    #[allow(clippy::unnecessary_cast)]
     pub fn set_mute(card: i32, control: &str, muted: bool, restore_level: f64) -> bool {
+        let restore_level = sanitize_unit(restore_level);
         Self::with_elem(card, control, |vt, elem| unsafe {
             if (vt.has_playback_switch)(elem) != 0 {
-                return (vt.set_playback_switch_all)(elem, if muted { 0 } else { 1 }) >= 0;
+                return (vt.set_playback_switch_all)(elem, i32::from(!muted)) >= 0;
             }
-            if muted {
-                let (mut min, mut max): (c_long, c_long) = (0, 0);
-                if (vt.get_playback_db_range)(elem, &raw mut min, &raw mut max) == 0 && max > min {
-                    return (vt.set_playback_db_all)(elem, min, 0) >= 0;
-                }
-                let (mut rmin, mut rmax): (c_long, c_long) = (0, 0);
-                if (vt.get_playback_vol_range)(elem, &raw mut rmin, &raw mut rmax) == 0
-                    && rmax > rmin
-                {
-                    return (vt.set_playback_vol_all)(elem, rmin) >= 0;
-                }
-                false
-            } else {
-                let level = restore_level.clamp(0.0, 1.0);
-                let (mut min, mut max): (c_long, c_long) = (0, 0);
-                if (vt.get_playback_db_range)(elem, &raw mut min, &raw mut max) == 0 && max > min {
-                    let db = level_to_db(min as i64, max as i64, level);
-                    return (vt.set_playback_db_all)(elem, db as c_long, 0) >= 0;
-                }
-                let (mut rmin, mut rmax): (c_long, c_long) = (0, 0);
-                if (vt.get_playback_vol_range)(elem, &raw mut rmin, &raw mut rmax) == 0
-                    && rmax > rmin
-                {
-                    let raw = level_to_raw(rmin as i64, rmax as i64, level);
-                    return (vt.set_playback_vol_all)(elem, raw as c_long) >= 0;
-                }
-                false
-            }
+            write_elem_target(vt, elem, (!muted).then_some(restore_level))
         })
     }
 
@@ -249,88 +274,63 @@ impl AlsaMixer {
     where
         F: FnMut(&AlsaVtable, *mut c_void) -> bool,
     {
-        let Some(vt) = vtable() else {
+        let Some(session) = MixerSession::open(card, true) else {
             return false;
         };
-        let Ok(hw_name) = CString::new(format!("hw:{card}")) else {
-            return false;
-        };
-        let Ok(ctrl_name) = CString::new(control) else {
-            return false;
-        };
-
         unsafe {
-            struct Guard<'a> {
-                vt: &'a AlsaVtable,
-                mixer: *mut c_void,
-                id: *mut c_void,
-            }
-            impl Drop for Guard<'_> {
-                fn drop(&mut self) {
-                    unsafe {
-                        if !self.id.is_null() {
-                            (self.vt.selem_id_free)(self.id);
-                        }
-                        if !self.mixer.is_null() {
-                            (self.vt.mixer_close)(self.mixer);
-                        }
-                    }
-                }
-            }
-
-            let mut guard = Guard {
-                vt,
-                mixer: ptr::null_mut(),
-                id: ptr::null_mut(),
+            let Some(elem) = session.find_playback_vol_elem(control) else {
+                return false;
             };
+            f(session.vt, elem)
+        }
+    }
+}
 
-            let mut mixer: *mut c_void = ptr::null_mut();
-            if (vt.mixer_open)(&raw mut mixer, 0) < 0 || mixer.is_null() {
-                return false;
-            }
-            guard.mixer = mixer;
+enum HwOp {
+    Level {
+        card: i32,
+        control: String,
+        level: f64,
+    },
+    Mute {
+        card: i32,
+        control: String,
+        muted: bool,
+        restore_level: f64,
+    },
+}
 
-            if (vt.mixer_attach)(guard.mixer, hw_name.as_ptr()) < 0 {
-                return false;
-            }
-            if (vt.mixer_selem_register)(guard.mixer, ptr::null_mut(), ptr::null_mut()) < 0 {
-                return false;
-            }
-            if (vt.mixer_load)(guard.mixer) < 0 {
-                return false;
-            }
-
-            let mut id: *mut c_void = ptr::null_mut();
-            if (vt.selem_id_malloc)(&raw mut id) < 0 || id.is_null() {
-                return false;
-            }
-            guard.id = id;
-
-            (vt.selem_id_set_index)(guard.id, 0);
-            (vt.selem_id_set_name)(guard.id, ctrl_name.as_ptr());
-            let elem = (vt.find_selem)(guard.mixer, guard.id);
-            if elem.is_null() || (vt.has_playback_volume)(elem) == 0 {
-                return false;
-            }
-            f(vt, elem)
+impl HwOp {
+    fn matches_kind_and_target(&self, card: i32, control: &str, is_mute: bool) -> bool {
+        match self {
+            Self::Level {
+                card: c,
+                control: ctrl,
+                ..
+            } => !is_mute && *c == card && ctrl == control,
+            Self::Mute {
+                card: c,
+                control: ctrl,
+                ..
+            } => is_mute && *c == card && ctrl == control,
         }
     }
 }
 
 #[derive(Default)]
 struct HwWritePending {
-    target: Option<(i32, String)>,
-    pending_level: Option<f64>,
-    pending_mute: Option<(bool, f64)>,
+    ops: VecDeque<HwOp>,
     last_written_at: Option<Instant>,
     shutdown: bool,
 }
 
-/// Asynchronous hardware mixer writer that coalesces rapid volume/mute updates
-/// so dragging UI sliders or synced PipeWire sliders never stalls on `snd_mixer_*`.
+/// Asynchronous hardware mixer writer that coalesces rapid volume/mute updates per mixer target
+/// while preserving relative mute/level ordering across ops so UI/PipeWire dragging never stalls
+/// on `snd_mixer_*`.
 pub struct CoalescedHwWriter {
     state: Arc<(Mutex<HwWritePending>, Condvar)>,
     has_pending: Arc<AtomicBool>,
+    sink: Arc<dyn HwMixerSink + Send + Sync>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -339,84 +339,126 @@ impl CoalescedHwWriter {
         Self::with_sink(Arc::new(AlsaHardwareSink))
     }
 
-    fn with_sink<S: HwMixerSink + Send + Sync + 'static>(sink: Arc<S>) -> Self {
+    fn with_sink(sink: Arc<dyn HwMixerSink + Send + Sync>) -> Self {
         let state = Arc::new((Mutex::new(HwWritePending::default()), Condvar::new()));
         let has_pending = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
         let worker_pending = Arc::clone(&has_pending);
+        let worker_sink = Arc::clone(&sink);
 
-        let worker = thread::Builder::new()
+        let worker = match thread::Builder::new()
             .name("rustygrade-alsa-hw-writer".to_owned())
             .spawn(move || {
                 let (lock, cvar) = &*worker_state;
                 loop {
-                    let (target, level, mute) = {
+                    let op = {
                         let mut guard = match lock.lock() {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        while !guard.shutdown
-                            && guard.pending_level.is_none()
-                            && guard.pending_mute.is_none()
-                        {
+                        while !guard.shutdown && guard.ops.is_empty() {
                             worker_pending.store(false, Ordering::Release);
                             guard = match cvar.wait(guard) {
                                 Ok(g) => g,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
                         }
-                        if guard.shutdown
-                            && guard.pending_level.is_none()
-                            && guard.pending_mute.is_none()
-                        {
-                            break;
+                        match guard.ops.pop_front() {
+                            Some(op) => op,
+                            None if guard.shutdown => {
+                                worker_pending.store(false, Ordering::Release);
+                                break;
+                            }
+                            None => continue,
                         }
-                        let target = guard.target.clone();
-                        let level = guard.pending_level.take();
-                        let mute = guard.pending_mute.take();
-                        (target, level, mute)
                     };
 
-                    if let Some((card, control)) = target {
-                        let mut wrote = false;
-                        if let Some(level) = level {
-                            wrote |= sink.write_level(card, &control, level);
-                        }
-                        if let Some((muted, restore_level)) = mute {
-                            wrote |= sink.set_mute(card, &control, muted, restore_level);
-                        }
-                        if wrote {
-                            let mut guard = match lock.lock() {
-                                Ok(g) => g,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            guard.last_written_at = Some(Instant::now());
-                        }
+                    let wrote = match op {
+                        HwOp::Level {
+                            card,
+                            control,
+                            level,
+                        } => worker_sink.write_level(card, &control, level),
+                        HwOp::Mute {
+                            card,
+                            control,
+                            muted,
+                            restore_level,
+                        } => worker_sink.set_mute(card, &control, muted, restore_level),
+                    };
+                    if wrote {
+                        let mut guard = match lock.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.last_written_at = Some(Instant::now());
                     }
                 }
-            })
-            .ok();
+            }) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!("failed to spawn ALSA hw writer thread, using synchronous fallback: {e}");
+                None
+            }
+        };
 
         Self {
             state,
             has_pending,
+            sink,
             worker,
         }
     }
 
-    pub fn push_level(&self, card: i32, control: impl Into<String>, level: f64) {
+    fn push_op(&self, op: HwOp) {
         if self.worker.is_none() {
+            let wrote = match op {
+                HwOp::Level {
+                    card,
+                    control,
+                    level,
+                } => self.sink.write_level(card, &control, level),
+                HwOp::Mute {
+                    card,
+                    control,
+                    muted,
+                    restore_level,
+                } => self.sink.set_mute(card, &control, muted, restore_level),
+            };
+            if wrote {
+                let (lock, _) = &*self.state;
+                let mut guard = match lock.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.last_written_at = Some(Instant::now());
+            }
             return;
         }
+
+        let (card, control, is_mute) = match &op {
+            HwOp::Level { card, control, .. } => (*card, control.as_str(), false),
+            HwOp::Mute { card, control, .. } => (*card, control.as_str(), true),
+        };
         let (lock, cvar) = &*self.state;
         let mut guard = match lock.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.target = Some((card, control.into()));
-        guard.pending_level = Some(level.clamp(0.0, 1.0));
+        guard
+            .ops
+            .retain(|existing| !existing.matches_kind_and_target(card, control, is_mute));
+        guard.ops.push_back(op);
         self.has_pending.store(true, Ordering::Release);
         cvar.notify_one();
+    }
+
+    pub fn push_level(&self, card: i32, control: impl Into<String>, level: f64) {
+        self.push_op(HwOp::Level {
+            card,
+            control: control.into(),
+            level: sanitize_unit(level),
+        });
     }
 
     pub fn push_mute(
@@ -426,21 +468,15 @@ impl CoalescedHwWriter {
         muted: bool,
         restore_level: f64,
     ) {
-        if self.worker.is_none() {
-            return;
-        }
-        let (lock, cvar) = &*self.state;
-        let mut guard = match lock.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.target = Some((card, control.into()));
-        guard.pending_mute = Some((muted, restore_level.clamp(0.0, 1.0)));
-        self.has_pending.store(true, Ordering::Release);
-        cvar.notify_one();
+        self.push_op(HwOp::Mute {
+            card,
+            control: control.into(),
+            muted,
+            restore_level: sanitize_unit(restore_level),
+        });
     }
 
-    /// True if a write happened within `window` or a write is currently queued.
+    /// True if a write happened within `window` or a write is currently queued/in-flight.
     pub fn recently_wrote(&self, window: Duration) -> bool {
         if self.has_pending.load(Ordering::Acquire) {
             return true;
@@ -450,9 +486,7 @@ impl CoalescedHwWriter {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard
-            .last_written_at
-            .is_some_and(|t| t.elapsed() < window)
+        guard.last_written_at.is_some_and(|t| t.elapsed() < window)
     }
 }
 
@@ -496,32 +530,47 @@ impl HwMixerSink for AlsaHardwareSink {
     }
 }
 
+fn sanitize_unit(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 pub fn db_to_level(min: i64, max: i64, db: i64) -> f64 {
-    let lo = min.max(max - MAX_SPAN_CENTI_DB);
-    if max <= lo {
+    let lo = min.max(max.saturating_sub(MAX_SPAN_CENTI_DB));
+    let span = max as i128 - lo as i128;
+    if span <= 0 {
         return 1.0;
     }
-    ((db - lo) as f64 / (max - lo) as f64).clamp(0.0, 1.0)
+    (((db as i128 - lo as i128) as f64) / (span as f64)).clamp(0.0, 1.0)
 }
 
 pub fn level_to_db(min: i64, max: i64, level: f64) -> i64 {
-    let level = level.clamp(0.0, 1.0);
+    let level = sanitize_unit(level);
     if level <= 0.0 {
         return min;
     }
-    let lo = min.max(max - MAX_SPAN_CENTI_DB);
-    lo + ((max - lo) as f64 * level).round() as i64
+    let lo = min.max(max.saturating_sub(MAX_SPAN_CENTI_DB));
+    let span = (max as i128 - lo as i128).max(0);
+    (lo as i128 + ((span as f64) * level).round() as i128).clamp(min as i128, max.max(min) as i128)
+        as i64
 }
 
-pub fn raw_to_level(min: i64, max: i64, raw: i64) -> f64 {
-    if max <= min {
+pub(crate) fn raw_to_level(min: i64, max: i64, raw: i64) -> f64 {
+    let span = max as i128 - min as i128;
+    if span <= 0 {
         return 1.0;
     }
-    ((raw - min) as f64 / (max - min) as f64).clamp(0.0, 1.0)
+    (((raw as i128 - min as i128) as f64) / (span as f64)).clamp(0.0, 1.0)
 }
 
-pub fn level_to_raw(min: i64, max: i64, level: f64) -> i64 {
-    min + ((max - min) as f64 * level.clamp(0.0, 1.0)).round() as i64
+pub(crate) fn level_to_raw(min: i64, max: i64, level: f64) -> i64 {
+    let level = sanitize_unit(level);
+    let span = (max as i128 - min as i128).max(0);
+    (min as i128 + ((span as f64) * level).round() as i128).clamp(min as i128, max.max(min) as i128)
+        as i64
 }
 
 #[cfg(test)]
@@ -534,35 +583,50 @@ mod tests {
         assert!((db_to_level(-3000, 0, -1800) - 0.4).abs() < 1e-6);
         assert_eq!(level_to_db(-3000, 0, 0.7), -900);
         assert_eq!(level_to_db(-3000, 0, 0.0), -3000);
+        assert_eq!(level_to_db(-3000, 0, f64::NAN), -3000);
 
         // Wide 90 dB card (-9000..0): only top 60 dB maps across 0..1, level 0 drops to min (-9000).
         assert!((db_to_level(-9000, 0, -3000) - 0.5).abs() < 1e-6);
         assert_eq!(level_to_db(-9000, 0, 0.5), -3000);
         assert_eq!(level_to_db(-9000, 0, 0.0), -9000);
+        assert_eq!(level_to_db(i64::MIN, i64::MIN + 100, 0.5), i64::MIN + 50);
     }
 
     #[test]
-    fn coalesced_hw_writer_delivers_latest_level() {
+    fn coalesced_hw_writer_delivers_latest_level_and_preserves_order() {
         use std::sync::Barrier;
+
+        #[derive(Debug, PartialEq)]
+        enum Recorded {
+            Level(i32, String, f64),
+            Mute(i32, String, bool, f64),
+        }
 
         struct MockSink {
             started: Barrier,
             release: Barrier,
-            writes: Mutex<Vec<(i32, String, f64)>>,
+            writes: Mutex<Vec<Recorded>>,
         }
         impl HwMixerSink for MockSink {
             fn write_level(&self, card: i32, control: &str, level: f64) -> bool {
-                if self.writes.lock().unwrap().is_empty() {
-                    self.started.wait();
-                    self.release.wait();
-                }
+                let first = self.writes.lock().unwrap().is_empty();
                 self.writes
                     .lock()
                     .unwrap()
-                    .push((card, control.to_owned(), level));
+                    .push(Recorded::Level(card, control.to_owned(), level));
+                if first {
+                    self.started.wait();
+                    self.release.wait();
+                }
                 true
             }
-            fn set_mute(&self, _: i32, _: &str, _: bool, _: f64) -> bool {
+            fn set_mute(&self, card: i32, control: &str, muted: bool, restore_level: f64) -> bool {
+                self.writes.lock().unwrap().push(Recorded::Mute(
+                    card,
+                    control.to_owned(),
+                    muted,
+                    restore_level,
+                ));
                 true
             }
         }
@@ -572,20 +636,26 @@ mod tests {
             release: Barrier::new(2),
             writes: Mutex::new(Vec::new()),
         });
-        let writer = CoalescedHwWriter::with_sink(Arc::clone(&sink));
+        let writer =
+            CoalescedHwWriter::with_sink(Arc::clone(&sink) as Arc<dyn HwMixerSink + Send + Sync>);
 
         writer.push_level(0, "PCM", 0.10);
         sink.started.wait();
-        // Rapid burst while first write is in progress; intermediates collapse to 0.72.
+        // Rapid burst while first write is in progress; intermediates collapse to 0.72,
+        // and mute before final level keeps exact mute->level causal ordering.
         writer.push_level(0, "PCM", 0.25);
+        writer.push_mute(0, "PCM", false, 0.25);
         writer.push_level(0, "PCM", 0.45);
         writer.push_level(0, "PCM", 0.72);
+        writer.push_level(1, "Master", 0.40);
         sink.release.wait();
 
         drop(writer);
         let writes = sink.writes.lock().unwrap();
-        assert_eq!(writes.len(), 2);
-        assert!((writes[0].2 - 0.10).abs() < 1e-6);
-        assert!((writes[1].2 - 0.72).abs() < 1e-6);
+        assert_eq!(writes.len(), 4);
+        assert_eq!(writes[0], Recorded::Level(0, "PCM".into(), 0.10));
+        assert_eq!(writes[1], Recorded::Mute(0, "PCM".into(), false, 0.25));
+        assert_eq!(writes[2], Recorded::Level(0, "PCM".into(), 0.72));
+        assert_eq!(writes[3], Recorded::Level(1, "Master".into(), 0.40));
     }
 }

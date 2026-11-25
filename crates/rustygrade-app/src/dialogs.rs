@@ -4,12 +4,14 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, mouse_area, opaque, row, space, stack, text};
+use iced::widget::{
+    button, column, container, mouse_area, opaque, row, space, stack, text, text_input,
+};
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::theme;
 use crate::views::bold;
-use crate::Message;
+use crate::{App, Message};
 
 /// What a confirmed WARNING dialog does.
 #[derive(Debug, Clone)]
@@ -19,8 +21,8 @@ pub enum ConfirmAction {
     /// Delete a playlist and its unreferenced cover files.
     DeletePlaylist(i64),
     DeleteSmartPlaylist(i64),
-    /// Delete the named albums from `library.json`.
-    DeleteAlbums(Vec<String>),
+    /// Delete the `(name, artist)` albums from `library.json`.
+    DeleteAlbums(Vec<(String, String)>),
     /// Replace all collections (playlists, favorites, smart playlists) from a `.zip` backup.
     ReplaceCollectionsZip(PathBuf),
 }
@@ -45,9 +47,17 @@ fn cancel_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
             let hover = matches!(s, button::Status::Hovered);
             button::Style {
                 background: hover.then_some(Background::Color(theme::LINE_SOFT)),
-                text_color: if hover { Color::WHITE } else { Color::from_rgb8(0x6B, 0x69, 0x63) },
+                text_color: if hover {
+                    Color::WHITE
+                } else {
+                    theme::TEXT_SUBTLE
+                },
                 border: Border {
-                    color: if hover { Color::from_rgb8(0x46, 0x46, 0x4C) } else { Color::TRANSPARENT },
+                    color: if hover {
+                        theme::BORDER_STRONG
+                    } else {
+                        Color::TRANSPARENT
+                    },
                     width: 1.0,
                     radius: 0.0.into(),
                 },
@@ -62,7 +72,11 @@ pub fn ok_button<'a>(label: &'a str, msg: Message) -> Element<'a, Message> {
     button(text(label).size(10).font(bold()))
         .padding([8, 24])
         .style(|_t, s| button::Style {
-            background: Some(Background::Color(if matches!(s, button::Status::Hovered) { Color::WHITE } else { theme::GOLD })),
+            background: Some(Background::Color(if matches!(s, button::Status::Hovered) {
+                Color::WHITE
+            } else {
+                theme::GOLD
+            })),
             text_color: Color::BLACK,
             border: Border::default(),
             ..Default::default()
@@ -100,49 +114,83 @@ pub fn modal_frame_sized<'a>(
         head_row = head_row.push(space::horizontal()).push(right);
     }
     let head = container(head_row)
-    .padding([12, 24])
-    .width(Length::Fill)
-    .style(|_t| container::Style {
-        background: Some(Background::Color(theme::LINE_SOFT)),
-        border: Border { color: theme::LINE, width: 1.0, radius: 0.0.into() },
-        ..Default::default()
-    });
-    let foot = container(footer).padding(16).width(Length::Fill).style(|_t| container::Style {
-        background: Some(Background::Color(theme::PANEL)),
-        border: Border { color: theme::LINE, width: 1.0, radius: 0.0.into() },
-        ..Default::default()
-    });
+        .padding([12, 24])
+        .width(Length::Fill)
+        .style(|_t| container::Style {
+            background: Some(Background::Color(theme::LINE_SOFT)),
+            border: Border {
+                color: theme::LINE,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        });
+    let foot = container(footer)
+        .padding(16)
+        .width(Length::Fill)
+        .style(|_t| container::Style {
+            background: Some(Background::Color(theme::PANEL)),
+            border: Border {
+                color: theme::LINE,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        });
     let corner_color = chrome.corner_color;
-    let corner = container(
-        column![
-            container(container(space::horizontal()).width(2).height(10).style(theme::fill_style(corner_color)))
-                .width(12)
-                .align_x(Alignment::End),
-            container(space::horizontal()).width(12).height(2).style(theme::fill_style(corner_color)),
-        ],
-    )
+    let corner = container(column![
+        container(
+            container(space::horizontal())
+                .width(2)
+                .height(10)
+                .style(theme::fill_style(corner_color))
+        )
+        .width(12)
+        .align_x(Alignment::End),
+        container(space::horizontal())
+            .width(12)
+            .height(2)
+            .style(theme::fill_style(corner_color)),
+    ])
     .width(Length::Fill)
     .height(Length::Fill)
     .align_x(Alignment::End)
     .align_y(Alignment::End);
-    let card = container(stack![column![head, container(body).padding(24).width(Length::Fill), foot], corner])
-        .width(Length::Fixed(chrome.width))
-        .style(|_t| container::Style {
-            background: Some(Background::Color(theme::RAISED)),
-            border: Border { color: Color::from_rgb8(0x46, 0x46, 0x4C), width: 1.0, radius: 0.0.into() },
-            text_color: Some(theme::TEXT),
-            ..Default::default()
-        });
+    let card = container(stack![
+        column![head, container(body).padding(24).width(Length::Fill), foot],
+        corner
+    ])
+    .width(Length::Fixed(chrome.width))
+    .style(|_t| container::Style {
+        background: Some(Background::Color(theme::RAISED)),
+        border: Border {
+            color: theme::BORDER_STRONG,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        text_color: Some(theme::TEXT),
+        ..Default::default()
+    });
     // Border.backdrop[IsVisible=True]: the dim backdrop and the card fade in over 200 ms. The card's
     // fade is of its content over its own color (what lies under it varies).
     let card = crate::motion::enter(
         "modal-card",
-        crate::motion::EnterSpec::new(200, crate::motion::Ease::Linear, 0.0, crate::motion::Fade::Cover(theme::RAISED)),
+        crate::motion::EnterSpec::new(
+            200,
+            crate::motion::Ease::Linear,
+            0.0,
+            crate::motion::Fade::Cover(theme::RAISED),
+        ),
         card,
     );
     let backdrop = crate::motion::enter(
         "modal",
-        crate::motion::EnterSpec::new(200, crate::motion::Ease::Linear, 0.0, crate::motion::Fade::Scrim(Color::from_rgba(0.0, 0.0, 0.0, 0.8))),
+        crate::motion::EnterSpec::new(
+            200,
+            crate::motion::Ease::Linear,
+            0.0,
+            crate::motion::Fade::Scrim(Color::from_rgba(0.0, 0.0, 0.0, 0.8)),
+        ),
         container(opaque(card))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -178,12 +226,18 @@ pub fn modal_frame<'a>(
 
 /// WARNING: ... with the target, optional detail block, an optional note, CANCEL and the confirm button.
 pub fn confirm_view(d: &ConfirmDialog) -> Element<'_, Message> {
-    let soft = Color::from_rgb8(0xCF, 0xCC, 0xC4);
-    let target_color = if d.target_orange { theme::ORANGE } else { Color::WHITE };
+    let target_color = if d.target_orange {
+        theme::ORANGE
+    } else {
+        Color::WHITE
+    };
     let mut body = column![
         row![
-            text(d.target_label).size(14).color(soft),
-            text(d.target.as_str()).size(14).font(bold()).color(target_color),
+            text(d.target_label).size(14).color(theme::TEXT_SOFT),
+            text(d.target.as_str())
+                .size(14)
+                .font(bold())
+                .color(target_color),
         ]
         .wrap(),
     ]
@@ -204,7 +258,7 @@ pub fn confirm_view(d: &ConfirmDialog) -> Element<'_, Message> {
             .padding([2, 0]),
         );
     }
-    body = body.push(text(d.note).size(14).color(soft));
+    body = body.push(text(d.note).size(14).color(theme::TEXT_SOFT));
     let footer = row![
         space::horizontal(),
         cancel_button("CANCEL", Message::ConfirmCancel),
@@ -246,7 +300,10 @@ pub fn deleting_overlay(turn: f32) -> Element<'static, Message> {
                     end_angle: iced::Radians(start + std::f32::consts::FRAC_PI_2),
                 });
             });
-            frame.stroke(&arc, Stroke::default().with_color(theme::GOLD).with_width(2.0));
+            frame.stroke(
+                &arc,
+                Stroke::default().with_color(theme::GOLD).with_width(2.0),
+            );
             vec![frame.into_geometry()]
         }
     }
@@ -273,21 +330,34 @@ pub fn deleting_overlay(turn: f32) -> Element<'static, Message> {
 pub fn background_prompt(remember: bool) -> Element<'static, Message> {
     let check = button(
         row![
-            container(text(if remember { "✓" } else { "" }).size(11).font(bold()).color(Color::BLACK))
-                .width(16)
-                .height(16)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .style(move |_t| container::Style {
-                    background: remember.then_some(Background::Color(theme::GOLD)),
-                    border: Border {
-                        color: if remember { theme::GOLD } else { Color::from_rgb8(0x6B, 0x69, 0x63) },
-                        width: 1.0,
-                        radius: 2.0.into(),
+            container(
+                text(if remember { "✓" } else { "" })
+                    .size(11)
+                    .font(bold())
+                    .color(Color::BLACK)
+            )
+            .width(16)
+            .height(16)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(move |_t| container::Style {
+                background: remember.then_some(Background::Color(theme::GOLD)),
+                border: Border {
+                    color: if remember {
+                        theme::GOLD
+                    } else {
+                        theme::TEXT_SUBTLE
                     },
-                    ..Default::default()
-                }),
-            text("REMEMBER MY CHOICE").size(11).color(if remember { theme::TEXT } else { theme::TEXT_DIM }),
+                    width: 1.0,
+                    radius: 2.0.into(),
+                },
+                ..Default::default()
+            }),
+            text("REMEMBER MY CHOICE").size(11).color(if remember {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            }),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
@@ -296,7 +366,7 @@ pub fn background_prompt(remember: bool) -> Element<'static, Message> {
     .style(theme::bare_button_style())
     .on_press(Message::BackgroundRemember(!remember));
     let body = column![
-        text("Keep music playing in the background?").size(14).color(Color::from_rgb8(0xCF, 0xCC, 0xC4)),
+        text("Keep music playing in the background?").size(14).color(theme::TEXT_SOFT),
         text(
             "If you choose MINIMIZE, the player will stay active in your system tray when closed. You can toggle this \
              setting anytime from the tray icon right-click menu.",
@@ -321,4 +391,51 @@ pub fn background_prompt(remember: bool) -> Element<'static, Message> {
     .align_y(Alignment::Center)
     .into();
     modal_frame("BACKGROUND_PLAY", body, footer, None)
+}
+
+/// NEW_PLAYLIST_ENTRY: asks for the name of a new playlist.
+pub fn create_playlist_modal<'a>(app: &'a App) -> Element<'a, Message> {
+    let body = container(
+        text_input("ENTER_DESIGNATION...", &app.new_playlist_name)
+            .id(app.create_input_id.clone())
+            .on_input(Message::NewPlaylistNameChanged)
+            .on_submit(Message::CreatePlaylist)
+            .size(13)
+            .padding([10, 10])
+            .style(|_t, _s| text_input::Style {
+                background: Background::Color(Color::TRANSPARENT),
+                border: Border::default(),
+                icon: theme::TEXT_DIM,
+                placeholder: theme::TEXT_MUTE,
+                value: theme::TEXT,
+                selection: theme::with_alpha(theme::GOLD, 0.3),
+            }),
+    )
+    .style(|_t| container::Style {
+        background: Some(Background::Color(theme::VOID)),
+        border: Border {
+            color: theme::GOLD,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    })
+    .into();
+    let footer = row![
+        space::horizontal(),
+        button(text("CANCEL").size(10).font(bold()).color(theme::TEXT_DIM))
+            .padding([8, 16])
+            .style(theme::bare_button_style())
+            .on_press(Message::ToggleCreatePlaylist(false)),
+        ok_button("INITIALIZE", Message::CreatePlaylist),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center)
+    .into();
+    modal_frame(
+        "NEW_PLAYLIST_ENTRY",
+        body,
+        footer,
+        Some(Message::ToggleCreatePlaylist(false)),
+    )
 }

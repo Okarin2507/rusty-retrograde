@@ -3491,10 +3491,11 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-app"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "iced",
  "image",
+ "libc",
  "rustygrade-audio",
  "rustygrade-core",
  "rustygrade-linux",
@@ -3505,16 +3506,12 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-audio"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "libloading 0.9.1",
  "libspa",
  "libspa-sys",
  "pipewire",
- "regex",
- "rustygrade-core",
- "serde",
- "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3522,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "rustygrade-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "crc32fast",
  "fast_image_resize",
@@ -3537,13 +3534,12 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
  "urlencoding",
 ]
 
 [[package]]
 name = "rustygrade-linux"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "ashpd",
  "futures-util",

@@ -111,7 +111,10 @@ pub fn cpu_power_saving() -> bool {
             if let Some(epp) = read(&p.join("energy_performance_preference")) {
                 epps.push(epp);
             }
-            if let (Some(gov), Some(driver)) = (read(&p.join("scaling_governor")), read(&p.join("scaling_driver"))) {
+            if let (Some(gov), Some(driver)) = (
+                read(&p.join("scaling_governor")),
+                read(&p.join("scaling_driver")),
+            ) {
                 governors.push((gov, driver));
             }
         }
@@ -136,7 +139,11 @@ fn classify_cpu(platform: Option<&str>, epps: &[String], governors: &[(String, S
 /// The system profile the app follows in Auto mode: power-profiles-daemon's, or power saver
 /// whenever the CPU itself saves power.
 fn effective(ppd: PowerProfile, cpu_saving: bool) -> PowerProfile {
-    if cpu_saving { PowerProfile::PowerSaver } else { ppd }
+    if cpu_saving {
+        PowerProfile::PowerSaver
+    } else {
+        ppd
+    }
 }
 
 /// Live monitor for the system power profile: UPower's `power-profiles-daemon`
@@ -148,9 +155,16 @@ pub struct PowerProfileMonitor;
 impl PowerProfileMonitor {
     pub async fn start() -> (PowerProfile, mpsc::UnboundedReceiver<PowerProfile>) {
         let (ppd_initial, mut ppd_rx) = Self::start_ppd().await;
-        let mut cpu = tokio::task::spawn_blocking(cpu_power_saving).await.unwrap_or(false);
+        let mut cpu = tokio::task::spawn_blocking(cpu_power_saving)
+            .await
+            .unwrap_or(false);
         let initial = effective(ppd_initial, cpu);
-        debug!(profile = initial.label(), ppd = ppd_initial.label(), cpu_power_saving = cpu, "Power profile");
+        debug!(
+            profile = initial.label(),
+            ppd = ppd_initial.label(),
+            cpu_power_saving = cpu,
+            "Power profile"
+        );
 
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -162,6 +176,7 @@ impl PowerProfileMonitor {
             poll.tick().await;
             loop {
                 tokio::select! {
+                    _ = tx.closed() => break,
                     next = ppd_rx.recv(), if ppd_open => match next {
                         Some(p) => ppd = p,
                         None => ppd_open = false,
@@ -172,7 +187,11 @@ impl PowerProfileMonitor {
                 }
                 let next = effective(ppd, cpu);
                 if next != current {
-                    debug!(profile = next.label(), cpu_power_saving = cpu, "Power profile changed");
+                    debug!(
+                        profile = next.label(),
+                        cpu_power_saving = cpu,
+                        "Power profile changed"
+                    );
                     current = next;
                     if tx.send(next).is_err() {
                         break;
@@ -219,20 +238,34 @@ impl PowerProfileMonitor {
             };
 
             let initial = PowerProfile::from_ppd_str(&raw_profile);
-            debug!(profile = initial.label(), service = dest, "Connected to PowerProfilesDaemon");
+            debug!(
+                profile = initial.label(),
+                service = dest,
+                "Connected to PowerProfilesDaemon"
+            );
 
             tokio::spawn(async move {
                 // Keep system D-Bus connection alive inside this monitor task.
                 let _conn_keepalive = conn;
-                let mut stream = proxy.receive_property_changed::<String>("ActiveProfile").await;
+                let mut stream = proxy
+                    .receive_property_changed::<String>("ActiveProfile")
+                    .await;
                 let mut current = initial;
-                while let Some(changed) = stream.next().await {
-                    if let Ok(raw) = changed.get().await {
-                        let next = PowerProfile::from_ppd_str(&raw);
-                        if next != current {
-                            current = next;
-                            if tx.send(next).is_err() {
+                loop {
+                    tokio::select! {
+                        _ = tx.closed() => break,
+                        item = stream.next() => {
+                            let Some(changed) = item else {
                                 break;
+                            };
+                            if let Ok(raw) = changed.get().await {
+                                let next = PowerProfile::from_ppd_str(&raw);
+                                if next != current {
+                                    current = next;
+                                    if tx.send(next).is_err() {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -249,47 +282,57 @@ impl PowerProfileMonitor {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn cpu_power_saving_reads_epp_platform_and_governor() {
-        use super::classify_cpu;
-        let s = |v: &[&str]| v.iter().map(|x| format!("{x}\n")).collect::<Vec<_>>();
-        let g = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
-        assert!(classify_cpu(None, &s(&["power", "power"]), &[]));
-        assert!(!classify_cpu(None, &s(&["power", "balance_power"]), &[]));
-        assert!(!classify_cpu(None, &s(&["performance"]), &g(&[("powersave", "intel_pstate")])));
-        assert!(classify_cpu(Some("low-power\n"), &s(&["performance"]), &[]));
-        assert!(!classify_cpu(Some("balanced"), &[], &g(&[("powersave", "intel_pstate")])));
-        assert!(classify_cpu(None, &[], &g(&[("powersave", "acpi-cpufreq"), ("powersave", "acpi-cpufreq")])));
-        assert!(!classify_cpu(None, &[], &g(&[("schedutil", "acpi-cpufreq")])));
-        assert!(!classify_cpu(None, &[], &[]));
-    }
-
     use super::*;
 
     #[test]
-    fn render_tier_tracks_ppd_and_manual_overrides() {
+    fn cpu_power_saving_and_render_tier_resolve() {
+        let s = |v: &[&str]| v.iter().map(|x| format!("{x}\n")).collect::<Vec<_>>();
+        let g = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert!(classify_cpu(None, &s(&["power", "power"]), &[]));
+        assert!(!classify_cpu(None, &s(&["power", "balance_power"]), &[]));
+        assert!(!classify_cpu(
+            None,
+            &s(&["performance"]),
+            &g(&[("powersave", "intel_pstate")])
+        ));
+        assert!(classify_cpu(Some("low-power\n"), &s(&["performance"]), &[]));
+        assert!(classify_cpu(
+            None,
+            &[],
+            &g(&[("powersave", "acpi-cpufreq")])
+        ));
+        assert!(!classify_cpu(
+            None,
+            &[],
+            &g(&[("schedutil", "acpi-cpufreq")])
+        ));
+        assert!(!classify_cpu(None, &[], &[]));
+
         let ps = RenderTier::resolve(PerformanceMode::Auto, PowerProfile::PowerSaver);
-        assert_eq!(ps.fps_cap, 0);
-        assert!(!ps.enable_animations);
-        assert_eq!(ps.poll_interval_ms, 1000);
+        assert_eq!(
+            (ps.fps_cap, ps.enable_animations, ps.poll_interval_ms),
+            (0, false, 1000)
+        );
 
-        let perf = RenderTier::resolve(PerformanceMode::Auto, PowerProfile::Performance);
-        assert_eq!(perf.fps_cap, 60);
-        assert!(perf.enable_animations);
-
-        let forced_perf = RenderTier::resolve(PerformanceMode::Performance, PowerProfile::PowerSaver);
-        assert_eq!(forced_perf.effective_profile, PowerProfile::Performance);
-        assert_eq!(forced_perf.fps_cap, 60);
-        assert!(forced_perf.enable_animations);
-
-        let forced_ps = RenderTier::resolve(PerformanceMode::PowerSaver, PowerProfile::Performance);
-        assert_eq!(forced_ps.effective_profile, PowerProfile::PowerSaver);
-        assert_eq!(forced_ps.fps_cap, 0);
-        assert!(!forced_ps.enable_animations);
+        let forced_perf =
+            RenderTier::resolve(PerformanceMode::Performance, PowerProfile::PowerSaver);
+        assert_eq!(
+            (
+                forced_perf.effective_profile,
+                forced_perf.fps_cap,
+                forced_perf.enable_animations
+            ),
+            (PowerProfile::Performance, 60, true)
+        );
 
         let fallback = RenderTier::resolve(PerformanceMode::Auto, PowerProfile::Unknown);
-        assert_eq!(fallback.effective_profile, PowerProfile::Balanced);
-        assert_eq!(fallback.fps_cap, 60);
-        assert!(fallback.enable_animations);
+        assert_eq!(
+            (fallback.effective_profile, fallback.fps_cap),
+            (PowerProfile::Balanced, 60)
+        );
     }
 }

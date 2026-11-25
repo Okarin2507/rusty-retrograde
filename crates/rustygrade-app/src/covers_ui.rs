@@ -14,16 +14,34 @@ pub const MAX_FULL_COVERS: usize = 8;
 /// extension for paths and then fails, leaving a blank cover. Those are read from bytes, which sniff the format.
 fn load_handle(path: &Path) -> image::Handle {
     use std::io::Read;
-    let mut head = [0u8; 12];
-    let sniffed = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok();
-    if sniffed {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        let is_png = head.starts_with(&[0x89, b'P', b'N', b'G']);
-        let is_jpeg = head.starts_with(&[0xFF, 0xD8]);
-        let is_webp = &head[..4] == b"RIFF" && &head[8..12] == b"WEBP";
-        let mismatch = (is_png && ext != "png") || (is_jpeg && !matches!(ext.as_str(), "jpg" | "jpeg")) || (is_webp && ext != "webp");
-        if mismatch && let Ok(bytes) = std::fs::read(path) {
-            return image::Handle::from_bytes(bytes);
+    // Content-addressed `c_<hex>.<ext>` files are written with their true extension by `rustygrade-core`.
+    let content_addressed = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.starts_with("c_")
+            && n[2..]
+                .split('.')
+                .next()
+                .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
+    if !content_addressed {
+        let mut head = [0u8; 12];
+        if std::fs::File::open(path)
+            .and_then(|mut f| f.read_exact(&mut head))
+            .is_ok()
+        {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let is_png = head.starts_with(&[0x89, b'P', b'N', b'G']);
+            let is_jpeg = head.starts_with(&[0xFF, 0xD8]);
+            let is_webp = &head[..4] == b"RIFF" && &head[8..12] == b"WEBP";
+            let mismatch = (is_png && ext != "png")
+                || (is_jpeg && !matches!(ext.as_str(), "jpg" | "jpeg"))
+                || (is_webp && ext != "webp");
+            if mismatch && let Ok(bytes) = std::fs::read(path) {
+                return image::Handle::from_bytes(bytes);
+            }
         }
     }
     image::Handle::from_path(path)
@@ -34,13 +52,37 @@ pub struct CoverCache {
     thumbs: HashMap<PathBuf, image::Handle>,
     fulls: HashMap<PathBuf, image::Handle>,
     full_lru: VecDeque<PathBuf>,
+    album_live: HashSet<PathBuf>,
     playlist_live: HashSet<PathBuf>,
 }
 
 impl CoverCache {
+    fn insert_thumb_promoting(&mut self, path: PathBuf) {
+        if self.thumbs.contains_key(&path) {
+            return;
+        }
+        let handle = if let Some(full) = self.fulls.remove(&path) {
+            self.full_lru.retain(|x| x != &path);
+            full
+        } else {
+            load_handle(&path)
+        };
+        self.thumbs.insert(path, handle);
+    }
+
+    fn retain_live(&mut self) {
+        let album_live = &self.album_live;
+        let playlist_live = &self.playlist_live;
+        self.thumbs
+            .retain(|k, _| album_live.contains(k) || playlist_live.contains(k));
+        self.fulls
+            .retain(|k, _| album_live.contains(k) || playlist_live.contains(k));
+        self.full_lru
+            .retain(|k| album_live.contains(k) || playlist_live.contains(k));
+    }
+
     pub fn sync_albums(&mut self, albums: &[Album]) {
-        let mut live: HashSet<PathBuf> = HashSet::with_capacity(albums.len() * 2 + self.playlist_live.len());
-        live.extend(self.playlist_live.iter().cloned());
+        self.album_live.clear();
         for album in albums {
             // Register the small thumbnail for grid slots, or the full cover when no
             // thumbnail exists so the album never renders as a monogram.
@@ -49,20 +91,16 @@ impl CoverCache {
                 .as_ref()
                 .or(album.cover_full_path.as_ref());
             if let Some(p) = preferred {
-                self.thumbs
-                    .entry(p.clone())
-                    .or_insert_with(|| load_handle(p));
+                self.insert_thumb_promoting(p.clone());
             }
             if let Some(p) = &album.cover_thumb_path {
-                live.insert(p.clone());
+                self.album_live.insert(p.clone());
             }
             if let Some(p) = &album.cover_full_path {
-                live.insert(p.clone());
+                self.album_live.insert(p.clone());
             }
         }
-        self.thumbs.retain(|k, _| live.contains(k));
-        self.fulls.retain(|k, _| live.contains(k));
-        self.full_lru.retain(|k| live.contains(k));
+        self.retain_live();
     }
 
     /// Registers custom playlist covers (thumbnails) from `collections`.
@@ -75,10 +113,9 @@ impl CoverCache {
             let thumb = PlaylistCovers::thumb_for(&full);
             self.playlist_live.insert(full);
             self.playlist_live.insert(thumb.clone());
-            self.thumbs
-                .entry(thumb.clone())
-                .or_insert_with(|| load_handle(&thumb));
+            self.insert_thumb_promoting(thumb);
         }
+        self.retain_live();
     }
 
     pub fn ensure_thumb(&mut self, path: &Path) {
@@ -115,7 +152,8 @@ impl CoverCache {
     }
 
     fn insert_full_handle(&mut self, path: PathBuf, handle: image::Handle) {
-        if !self.fulls.contains_key(&path) && self.full_lru.len() >= MAX_FULL_COVERS
+        if !self.fulls.contains_key(&path)
+            && self.full_lru.len() >= MAX_FULL_COVERS
             && let Some(evict) = self.full_lru.pop_front()
         {
             self.fulls.remove(&evict);
@@ -125,8 +163,8 @@ impl CoverCache {
         self.full_lru.push_back(path);
     }
 
-    /// Drops stale cached handles for `paths` and reloads any existing files from bytes so
-    /// Iced allocates new GPU texture atlas IDs even when a cover overwrites an existing path.
+    /// Drops stale cached handles for `paths` and reloads already-cached files from bytes so
+    /// Iced allocates new GPU texture atlas IDs when a cover overwrites an existing path.
     pub fn invalidate_paths(&mut self, paths: &[PathBuf]) {
         for p in paths {
             let was_thumb = self.thumbs.remove(p).is_some();
@@ -134,11 +172,13 @@ impl CoverCache {
             if was_full {
                 self.full_lru.retain(|x| x != p);
             }
-            if let Ok(bytes) = std::fs::read(p) {
+            if (was_thumb || was_full)
+                && let Ok(bytes) = std::fs::read(p)
+            {
                 if was_thumb {
-                    self.thumbs.insert(p.clone(), image::Handle::from_bytes(bytes.clone()));
-                }
-                if was_full || !was_thumb {
+                    self.thumbs
+                        .insert(p.clone(), image::Handle::from_bytes(bytes));
+                } else {
                     self.insert_full_handle(p.clone(), image::Handle::from_bytes(bytes));
                 }
             }
@@ -159,10 +199,12 @@ impl CoverCache {
             match std::fs::read(p) {
                 Ok(bytes) => {
                     if in_thumbs {
-                        self.thumbs.insert(p.clone(), image::Handle::from_bytes(bytes.clone()));
+                        self.thumbs
+                            .insert(p.clone(), image::Handle::from_bytes(bytes.clone()));
                     }
                     if in_fulls {
-                        self.fulls.insert(p.clone(), image::Handle::from_bytes(bytes));
+                        self.fulls
+                            .insert(p.clone(), image::Handle::from_bytes(bytes));
                     }
                 }
                 Err(_) => {
@@ -200,29 +242,33 @@ pub fn render_cover<'a, M: 'a>(
             .border_radius(radius)
             .into()
     } else {
-        let ch = monogram
+        let ch: String = monogram
             .trim()
             .chars()
             .next()
             .unwrap_or('♪')
-            .to_ascii_uppercase()
-            .to_string();
+            .to_uppercase()
+            .collect();
         let font_size = (size * 0.36).clamp(11.0, 46.0);
-        container(text(ch).size(font_size).color(theme::with_alpha(accent, 0.72)))
-            .width(Length::Fixed(size))
-            .height(Length::Fixed(size))
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center)
-            .style(move |_theme| container::Style {
-                background: Some(Background::Color(theme::RAISED)),
-                border: Border {
-                    color: theme::LINE,
-                    width: 1.0,
-                    radius: radius.into(),
-                },
-                ..Default::default()
-            })
-            .into()
+        container(
+            text(ch)
+                .size(font_size)
+                .color(theme::with_alpha(accent, 0.72)),
+        )
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(theme::RAISED)),
+            border: Border {
+                color: theme::LINE,
+                width: 1.0,
+                radius: radius.into(),
+            },
+            ..Default::default()
+        })
+        .into()
     }
 }
 
@@ -242,7 +288,7 @@ mod tests {
         assert_eq!(cache.fulls.len(), MAX_FULL_COVERS);
         assert!(cache.get_first(&[Some(paths[0].as_path())]).is_some());
 
-        // Adding a 9th cover evicts the oldest unused one (`paths[1]`, since `paths[0]`? wait: `get_first` is &self, `ensure_full` promotes!)
+        // Adding a 9th cover evicts the oldest unused one (`paths[1]`, since `ensure_full` promotes `paths[0]`).
         cache.ensure_full(&paths[0]);
         cache.ensure_full(&paths[8]);
         assert_eq!(cache.fulls.len(), MAX_FULL_COVERS);

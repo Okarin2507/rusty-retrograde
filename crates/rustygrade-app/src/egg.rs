@@ -13,7 +13,7 @@ use crate::views::bold;
 use crate::{App, Message};
 
 /// Morse code for `LONETRAIL`: typing it on the sidebar visualizer unlocks `PRIVATE_MEMORY_BANK`.
-pub const TARGET_MORSE: &str = ".-.. --- -. . - .-. .- .. .-..";
+const TARGET_MORSE: &str = ".-.. --- -. . - .-. .- .. .-..";
 
 /// Resting bar heights as percentages of the 32 px visualizer strip (same order as Electron / C#).
 pub const BAR_HEIGHT_PCTS: [f32; 12] = [
@@ -80,7 +80,7 @@ impl EggMorseState {
 }
 
 /// Morse character emitted by clicking visualizer bar `index` (`Sidebar.jsx`).
-pub fn bar_symbol(index: usize) -> char {
+fn bar_symbol(index: usize) -> char {
     match index % 3 {
         0 => '.',
         1 => ' ',
@@ -104,11 +104,10 @@ pub fn decode_egg_assets() -> Option<EggAssets> {
     let raw = decoded.into_raw();
     let mut gray = Vec::with_capacity(raw.len());
     for px in raw.as_chunks::<4>().0 {
-        let luma = (0.2126 * f32::from(px[0])
-            + 0.7152 * f32::from(px[1])
-            + 0.0722 * f32::from(px[2]))
-        .round()
-        .clamp(0.0, 255.0) as u8;
+        let luma =
+            (0.2126 * f32::from(px[0]) + 0.7152 * f32::from(px[1]) + 0.0722 * f32::from(px[2]))
+                .round()
+                .clamp(0.0, 255.0) as u8;
         gray.extend_from_slice(&[luma, luma, luma, px[3]]);
     }
     Some(EggAssets {
@@ -120,64 +119,62 @@ pub fn decode_egg_assets() -> Option<EggAssets> {
 struct ScanlinesCanvas;
 
 impl<M> canvas::Program<M> for ScanlinesCanvas {
-    type State = ();
+    type State = canvas::Cache;
 
     fn draw(
         &self,
-        _state: &(),
+        state: &canvas::Cache,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let line_color = Color::from_rgba8(0, 0, 0, 0.25);
-        let mut y = 1.0f32;
-        while y < bounds.height {
-            frame.fill_rectangle(
-                Point::new(0.0, y),
-                Size::new(bounds.width, 1.0),
-                line_color,
-            );
-            y += 2.0;
-        }
-        vec![frame.into_geometry()]
+        let geom = state.draw(renderer, bounds.size(), |frame| {
+            let line_color = Color::from_rgba8(0, 0, 0, 0.25);
+            let mut y = 1.0f32;
+            while y < bounds.height {
+                frame.fill_rectangle(Point::new(0.0, y), Size::new(bounds.width, 1.0), line_color);
+                y += 2.0;
+            }
+        });
+        vec![geom]
     }
 }
 
 struct EggCornersCanvas;
 
 impl<M> canvas::Program<M> for EggCornersCanvas {
-    type State = ();
+    type State = canvas::Cache;
 
     fn draw(
         &self,
-        _state: &(),
+        state: &canvas::Cache,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let len = 16.0;
-        let thick = 2.0;
-        // Top-left bracket
-        frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(len, thick), theme::ORANGE);
-        frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(thick, len), theme::ORANGE);
-        // Bottom-right bracket
-        let rx = (bounds.width - len).max(0.0);
-        let ry = (bounds.height - len).max(0.0);
-        frame.fill_rectangle(
-            Point::new(rx, (bounds.height - thick).max(0.0)),
-            Size::new(len, thick),
-            theme::ORANGE,
-        );
-        frame.fill_rectangle(
-            Point::new((bounds.width - thick).max(0.0), ry),
-            Size::new(thick, len),
-            theme::ORANGE,
-        );
-        vec![frame.into_geometry()]
+        let geom = state.draw(renderer, bounds.size(), |frame| {
+            let len = 16.0;
+            let thick = 2.0;
+            // Top-left bracket
+            frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(len, thick), theme::ORANGE);
+            frame.fill_rectangle(Point::new(0.0, 0.0), Size::new(thick, len), theme::ORANGE);
+            // Bottom-right bracket
+            let rx = (bounds.width - len).max(0.0);
+            let ry = (bounds.height - len).max(0.0);
+            frame.fill_rectangle(
+                Point::new(rx, (bounds.height - thick).max(0.0)),
+                Size::new(len, thick),
+                theme::ORANGE,
+            );
+            frame.fill_rectangle(
+                Point::new((bounds.width - thick).max(0.0), ry),
+                Size::new(thick, len),
+                theme::ORANGE,
+            );
+        });
+        vec![geom]
     }
 }
 
@@ -185,14 +182,16 @@ pub fn view_egg_modal<'a>(app: &'a App) -> Element<'a, Message> {
     let header_bar = container(
         row![
             icons::icon("terminal", 12.0, theme::TEAL),
-            text(theme::tracked("PRIVATE_MEMORY_BANK // -.- .-. .. ... - . -."))
-                .size(10)
-                .color(theme::TEAL)
-                .width(Length::Fill),
+            text(theme::tracked(
+                "PRIVATE_MEMORY_BANK // -.- .-. .. ... - . -."
+            ))
+            .size(10)
+            .color(theme::TEAL)
+            .width(Length::Fill),
             button(icons::icon_hover(
                 "x",
                 16.0,
-                Color::from_rgb8(0x56, 0x55, 0x4F),
+                theme::TEXT_MUTE,
                 theme::ORANGE,
             ))
             .padding(2)
@@ -205,7 +204,7 @@ pub fn view_egg_modal<'a>(app: &'a App) -> Element<'a, Message> {
     .padding([8, 10])
     .width(Length::Fill)
     .style(|_t| container::Style {
-        background: Some(Background::Color(Color::from_rgb8(0x12, 0x12, 0x12))),
+        background: Some(Background::Color(theme::PANEL)),
         border: Border {
             color: theme::LINE,
             width: 1.0,
@@ -262,25 +261,21 @@ pub fn view_egg_modal<'a>(app: &'a App) -> Element<'a, Message> {
         } else {
             "MEMORY_BANK_UNAVAILABLE"
         };
-        container(
-            text(theme::tracked(msg))
-                .size(10)
-                .color(theme::TEXT_MUTE),
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(378.0))
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .style(|_t| container::Style {
-            background: Some(Background::Color(theme::VOID)),
-            border: Border {
-                color: theme::LINE,
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+        container(text(theme::tracked(msg)).size(10).color(theme::TEXT_MUTE))
+            .width(Length::Fill)
+            .height(Length::Fixed(378.0))
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(|_t| container::Style {
+                background: Some(Background::Color(theme::VOID)),
+                border: Border {
+                    color: theme::LINE,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
     };
 
     let pulse_alpha = if app.animations_enabled() {
@@ -304,7 +299,7 @@ pub fn view_egg_modal<'a>(app: &'a App) -> Element<'a, Message> {
                 "IF, IN A CENTURY OR A MILLENIUM, OUR DESCENDANTS WALK AMONG THE STARS, THE MASSES WILL SING HER PRAISES."
             ))
             .size(10)
-            .color(Color::from_rgb8(0x56, 0x55, 0x4F))
+            .color(theme::TEXT_MUTE)
             .align_x(Horizontal::Center)
             .wrapping(Wrapping::Word),
         ]
@@ -319,38 +314,43 @@ pub fn view_egg_modal<'a>(app: &'a App) -> Element<'a, Message> {
     })
     .width(Length::Fill)
     .style(|_t| container::Style {
-        background: Some(Background::Color(Color::from_rgb8(0x12, 0x12, 0x12))),
+        background: Some(Background::Color(theme::PANEL)),
         ..Default::default()
     });
 
     let inner = container(column![header_bar, pic_content, footer].width(Length::Fill))
         .width(Length::Fill)
         .style(|_t| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(0x08, 0x08, 0x0A))),
+            background: Some(Background::Color(theme::VOID)),
             ..Default::default()
         });
 
     let teal_frame = container(crate::motion::enter(
         "egg-card",
-        crate::motion::EnterSpec::new(1000, crate::motion::Ease::Linear, 0.0, crate::motion::Fade::Cover(Color::from_rgb8(0x08, 0x08, 0x0A))),
+        crate::motion::EnterSpec::new(
+            1000,
+            crate::motion::Ease::Linear,
+            0.0,
+            crate::motion::Fade::Cover(theme::VOID),
+        ),
         inner,
     ))
-        .padding(4)
-        .width(Length::Fixed(512.0))
-        .style(|_t| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(0x1A, 0x1A, 0x1C))),
-            border: Border {
-                color: theme::TEAL,
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            shadow: Shadow {
-                color: Color::from_rgba8(0x4F, 0xD6, 0xBE, 0.30),
-                offset: Vector::ZERO,
-                blur_radius: 50.0,
-            },
-            ..Default::default()
-        });
+    .padding(4)
+    .width(Length::Fixed(512.0))
+    .style(|_t| container::Style {
+        background: Some(Background::Color(theme::RAISED)),
+        border: Border {
+            color: theme::TEAL,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: Shadow {
+            color: theme::with_alpha(theme::TEAL, 0.30),
+            offset: Vector::ZERO,
+            blur_radius: 50.0,
+        },
+        ..Default::default()
+    });
 
     let card = opaque(
         container(stack![
@@ -366,7 +366,12 @@ pub fn view_egg_modal<'a>(app: &'a App) -> Element<'a, Message> {
     // over its own color).
     let backdrop = crate::motion::enter(
         "egg",
-        crate::motion::EnterSpec::new(1000, crate::motion::Ease::Linear, 0.0, crate::motion::Fade::Scrim(Color::from_rgba8(0, 0, 0, 0.95))),
+        crate::motion::EnterSpec::new(
+            1000,
+            crate::motion::Ease::Linear,
+            0.0,
+            crate::motion::Fade::Scrim(Color::from_rgba8(0, 0, 0, 0.95)),
+        ),
         container(card)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -388,20 +393,15 @@ mod tests {
     use super::*;
 
     fn tap_morse(state: &mut EggMorseState, pattern: &str) -> bool {
-        let mut unlocked = false;
-        for ch in pattern.chars() {
-            let idx = match ch {
+        pattern
+            .chars()
+            .map(|ch| match ch {
                 '.' => 0,
                 ' ' => 1,
                 '-' => 2,
                 _ => panic!("unexpected morse char {ch}"),
-            };
-            let (_, _, matched) = state.press(idx);
-            if matched {
-                unlocked = true;
-            }
-        }
-        unlocked
+            })
+            .fold(false, |acc, idx| acc | state.press(idx).2)
     }
 
     #[test]

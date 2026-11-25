@@ -26,5 +26,16 @@ pub use portal::{
     pick_playlist_import_file,
 };
 pub use power_profile::{PowerProfile, PowerProfileMonitor, RenderTier};
-pub use single_instance::{SingleInstance, SingleInstanceCommand, SingleInstanceGuard, SingleInstanceOutcome};
+pub use single_instance::{
+    SingleInstance, SingleInstanceCommand, SingleInstanceGuard, SingleInstanceOutcome,
+};
 pub use tray::{TrayCommand, TrayService, TrayToggles};
+
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}

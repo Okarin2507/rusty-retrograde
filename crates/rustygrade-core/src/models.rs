@@ -19,64 +19,79 @@ pub struct Track {
     pub cover_full_path: Option<PathBuf>,
 }
 
-impl Track {
-    pub fn short_codec(&self) -> String {
-        let raw = if self.codec.is_empty() {
-            Path::new(&self.file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-        } else {
-            self.codec.as_str()
-        };
-        let u = raw.trim().to_ascii_uppercase();
+/// Canonical short codec label (`FLAC`, `ALAC`, `AAC`, `MP3`, `OGG`, `OPUS`, `WAV`, `AIFF`,
+/// `WMA`, or fallback extension/uppercased prefix) shared by track display and smart playlists.
+pub fn normalize_codec(codec: &str, file_path: &str) -> String {
+    let trimmed = codec.trim();
+    if !trimmed.is_empty() {
+        let u = trimmed.to_ascii_uppercase();
         if u.contains("FLAC") {
-            "FLAC".to_owned()
-        } else if u.contains("ALAC") {
-            "ALAC".to_owned()
-        } else if u.contains("AAC") || u == "M4A" {
-            "AAC".to_owned()
-        } else if u.contains("OPUS") {
-            "OPUS".to_owned()
-        } else if u.contains("VORBIS") || u == "OGG" {
-            "OGG".to_owned()
-        } else if u.contains("MP3") || u.contains("MPEG") {
-            "MP3".to_owned()
-        } else if u.contains("WAV") || u.contains("PCM") {
-            "WAV".to_owned()
-        } else if u.contains("AIFF") {
-            "AIFF".to_owned()
-        } else {
-            u
+            return "FLAC".to_owned();
         }
+        if u.contains("ALAC") || u.contains("APPLE LOSSLESS") {
+            return "ALAC".to_owned();
+        }
+        if u.contains("AAC") || u == "M4A" {
+            return "AAC".to_owned();
+        }
+        if u.contains("OPUS") {
+            return "OPUS".to_owned();
+        }
+        if u.contains("VORBIS") || u == "OGG" {
+            return "OGG".to_owned();
+        }
+        if u.contains("MP3") || u.contains("MPEG") {
+            return "MP3".to_owned();
+        }
+        if u.contains("AIFF") {
+            return "AIFF".to_owned();
+        }
+        if u.contains("WAV") || u.contains("PCM") {
+            return "WAV".to_owned();
+        }
+        if u.contains("WINDOWS MEDIA") || u == "WMA" {
+            return "WMA".to_owned();
+        }
+        let ext = Path::new(file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !ext.is_empty() {
+            return ext.to_ascii_uppercase();
+        }
+        return u.chars().take(8).collect::<String>().trim().to_owned();
     }
 
-    pub fn quality_label(&self) -> String {
-        let mut parts = vec![self.short_codec()];
-        if self.bits_per_sample > 0 {
-            parts.push(format!("{}BIT", self.bits_per_sample));
-        }
-        if self.sample_rate > 0 {
-            if self.sample_rate >= 1000 {
-                let sr = self.sample_rate;
-                let khz = if sr % 1000 == 0 {
-                    format!("{}KHZ", sr / 1000)
-                } else {
-                    format!("{:.1}KHZ", sr as f64 / 1000.0)
-                };
-                parts.push(khz);
-            } else {
-                parts.push(format!("{}HZ", self.sample_rate));
-            }
-        }
-        parts.join(" / ")
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if ext.is_empty() {
+        String::new()
+    } else if ext.eq_ignore_ascii_case("m4a") {
+        "AAC".to_owned()
+    } else {
+        ext.to_ascii_uppercase()
+    }
+}
+
+impl Track {
+    pub fn short_codec(&self) -> String {
+        normalize_codec(&self.codec, &self.file_path)
     }
 
     pub fn album_quality_label(tracks: &[Track]) -> Option<String> {
         let first = tracks.first()?;
         let first_codec = first.short_codec();
-        let mixed = tracks.iter().skip(1).any(|t| t.short_codec() != first_codec);
-        let mut parts = vec![if mixed { "MIXED".to_owned() } else { first_codec }];
+        let mixed = tracks
+            .iter()
+            .skip(1)
+            .any(|t| t.short_codec() != first_codec);
+        let mut parts = vec![if mixed {
+            "MIXED".to_owned()
+        } else {
+            first_codec
+        }];
         if first.bits_per_sample > 0 {
             parts.push(format!("{}BIT", first.bits_per_sample));
         }
@@ -110,7 +125,7 @@ pub struct Album {
 #[derive(Debug, Clone)]
 pub struct ArtistSummary {
     pub name: String,
-    pub albums: Vec<Album>,
+    pub album_indices: Vec<usize>,
     pub track_count: usize,
     pub newest_added_at: i64,
 }

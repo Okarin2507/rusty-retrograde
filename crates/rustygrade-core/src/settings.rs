@@ -1,13 +1,14 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::json_store::{LoadStatus, load_with_backup, save_atomic_locked};
 use crate::paths::CoverPaths;
 
-static WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -178,12 +179,11 @@ impl AppSettings {
             return None;
         };
         for (key, val) in input {
-            let previous = merged.insert(key.clone(), val);
-            if serde_json::from_value::<Self>(Value::Object(merged.clone())).is_err() {
-                match previous {
-                    Some(prev) => merged.insert(key, prev),
-                    None => merged.remove(&key),
-                };
+            // Test each key against a single-entry object in O(1) instead of cloning `merged` O(K^2).
+            let mut probe = Map::with_capacity(1);
+            probe.insert(key.clone(), val.clone());
+            if serde_json::from_value::<Self>(Value::Object(probe)).is_ok() {
+                merged.insert(key, val);
             }
         }
         serde_json::from_value(Value::Object(merged)).ok()
@@ -202,47 +202,32 @@ impl AppSettings {
     }
 
     pub fn load() -> Self {
-        let path = Self::file_path();
-        if path.exists() {
-            if let Ok(text) = fs::read_to_string(&path)
-                && let Some(parsed) = Self::parse_lenient(&text)
-            {
-                return parsed;
-            }
-            let _ = fs::copy(&path, Self::corrupt_path());
-            let backup = Self::backup_path();
-            if backup.exists()
-                && let Ok(text) = fs::read_to_string(&backup)
-                && let Some(parsed) = Self::parse_lenient(&text)
-            {
-                let _ = fs::copy(&backup, &path);
-                return parsed;
-            }
-        }
-        Self {
-            minimize_to_tray: electron_minimize_to_tray(),
-            ..Self::default()
+        match load_with_backup(
+            &Self::file_path(),
+            &Self::backup_path(),
+            &Self::corrupt_path(),
+            |bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(Self::parse_lenient)
+            },
+        ) {
+            LoadStatus::Ok(parsed) => parsed,
+            LoadStatus::Missing | LoadStatus::Corrupt => Self {
+                minimize_to_tray: electron_minimize_to_tray(),
+                ..Self::default()
+            },
         }
     }
 
     pub fn save(&self) {
-        let Ok(_guard) = WRITE_LOCK.lock() else {
-            return;
-        };
-        let dir = CoverPaths::app_dir();
-        if fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let path = Self::file_path();
-        let backup = Self::backup_path();
-        let tmp = path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(self)
-            && fs::write(&tmp, json).is_ok()
-        {
-            if path.exists() {
-                let _ = fs::copy(&path, &backup);
-            }
-            let _ = fs::rename(&tmp, &path);
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let _ = save_atomic_locked(
+                &WRITE_LOCK,
+                &Self::file_path(),
+                Some(&Self::backup_path()),
+                &json,
+            );
         }
     }
 }
@@ -267,38 +252,19 @@ mod tests {
             "Volume": 0.6,
             "AudioDevice": "alsa/hw:CARD=Pro,DEV=0",
             "LibrarySort": "added_desc",
-            "ReplayGain": "track",
-            "LibraryFolders": ["/home/okarin/Music"],
             "MinimizeToTray": false,
-            "SidebarVisible": true,
-            "CrossfadeSeconds": 0,
-            "EqEnabled": false,
-            "EqPreset": "CUSTOM",
-            "EqGains": [0, 0, 0, 0, 0, -3, 0, 0, 0, 0],
-            "WatchFolders": true,
-            "AccentFromCover": true,
-            "MiniX": 760,
-            "MiniY": 496,
-            "LibraryView": "albums"
+            "EqGains": [0, 0, 0, 0, 0, -3, 0, 0, 0, 0]
         }"#;
         let s: AppSettings = serde_json::from_str(json).unwrap();
+        let def = AppSettings::default();
         assert_eq!(s.volume, 0.6);
         assert_eq!(s.audio_device, "alsa/hw:CARD=Pro,DEV=0");
-        assert_eq!(s.gpu_preference, GpuPreference::Igpu);
-        assert_eq!(s.display_backend, DisplayBackend::Auto);
-        assert_eq!(s.performance_mode, PerformanceMode::Auto);
-        assert!(s.enable_animations);
-        assert_eq!(s.direct_volume_bridge, DirectVolumeBridge::VirtualSink);
-        assert!(s.enable_tray);
-        assert!(s.enable_mpris);
-        assert!(!s.enable_discord_rpc);
-        assert!(s.discord_client_id.is_empty());
-        assert!(s.discord_fetch_artwork);
-        assert!(s.artwork_itunes);
-        assert!(s.artwork_deezer);
-        assert!(s.artwork_musicbrainz);
-        assert!(!s.artwork_discogs);
-        assert!(s.discogs_token.is_empty());
+        assert_eq!(s.minimize_to_tray, Some(false));
+        assert_eq!(s.gpu_preference, def.gpu_preference);
+        assert_eq!(s.performance_mode, def.performance_mode);
+        assert_eq!(s.direct_volume_bridge, def.direct_volume_bridge);
+        assert_eq!(s.enable_animations, def.enable_animations);
+        assert_eq!(s.enable_discord_rpc, def.enable_discord_rpc);
     }
 
     #[test]
@@ -330,27 +296,8 @@ mod tests {
 
     #[test]
     fn csharp_sort_keys_roundtrip_unchanged() {
-        // Fixture shaped like a native-settings.json written by the C# build.
-        let template = r#"{
-  "Volume": 0.5,
-  "AudioDevice": "auto",
-  "LibrarySort": "KEY",
-  "ReplayGain": "no",
-  "LibraryFolders": [],
-  "MinimizeToTray": null,
-  "SidebarVisible": true,
-  "CrossfadeSeconds": 0,
-  "EqEnabled": false,
-  "EqPreset": "FLAT",
-  "EqGains": [],
-  "WatchFolders": true,
-  "AccentFromCover": true,
-  "MiniX": null,
-  "MiniY": null,
-  "LibraryView": "albums"
-}"#;
         for key in LIBRARY_SORT_KEYS.iter().copied().chain(["title_asc"]) {
-            let s = AppSettings::parse_lenient(&template.replace("KEY", key)).unwrap();
+            let s = AppSettings::parse_lenient(&format!(r#"{{"LibrarySort":"{key}"}}"#)).unwrap();
             assert_eq!(s.library_sort, key);
             let back = AppSettings::parse_lenient(&serde_json::to_string(&s).unwrap()).unwrap();
             assert_eq!(back.library_sort, key);

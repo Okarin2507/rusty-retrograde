@@ -1,10 +1,10 @@
-use std::fs;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+use crate::json_store::{LoadStatus, load_with_backup, save_atomic_locked};
 use crate::paths::CoverPaths;
 
 pub type ExtraMap = Map<String, Value>;
@@ -78,8 +78,7 @@ pub struct CollectionsData {
     pub extra: Map<String, Value>,
 }
 
-static RESTORED_FROM_BACKUP: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
-static WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct CollectionsStore;
 
@@ -92,8 +91,8 @@ impl CollectionsStore {
         CoverPaths::app_dir().join("native-collections.json.bak")
     }
 
-    pub fn restored_from_backup() -> bool {
-        RESTORED_FROM_BACKUP.lock().map(|g| *g).unwrap_or(false)
+    pub fn corrupt_path() -> PathBuf {
+        CoverPaths::app_dir().join("native-collections.json.corrupt")
     }
 
     pub fn load() -> CollectionsData {
@@ -116,52 +115,28 @@ impl CollectionsStore {
         }
     }
 
-    /// The saved file, else its `.bak` when the file is unreadable; `None` when neither reads.
+    /// The saved file, else its `.bak` when the file is unreadable/missing; `None` when neither reads.
     fn load_existing() -> Option<CollectionsData> {
-        let path = Self::file_path();
-        if path.exists() {
-            if let Some(data) = Self::try_read(&path) {
-                return Some(data);
-            }
-            let corrupt = CoverPaths::app_dir().join("native-collections.json.corrupt");
-            let _ = fs::copy(&path, corrupt);
-            let backup = Self::backup_path();
-            if let Some(prev) = Self::try_read(&backup) {
-                if let Ok(mut flag) = RESTORED_FROM_BACKUP.lock() {
-                    *flag = true;
-                }
-                return Some(prev);
-            }
+        match load_with_backup(
+            &Self::file_path(),
+            &Self::backup_path(),
+            &Self::corrupt_path(),
+            |bytes| serde_json::from_slice::<CollectionsData>(bytes).ok(),
+        ) {
+            LoadStatus::Ok(data) => Some(data),
+            LoadStatus::Missing | LoadStatus::Corrupt => None,
         }
-        None
-    }
-
-    fn try_read(path: &std::path::Path) -> Option<CollectionsData> {
-        let text = fs::read_to_string(path).ok()?;
-        serde_json::from_str::<CollectionsData>(&text).ok()
     }
 
     pub fn save(data: &CollectionsData) {
-        let Ok(_guard) = WRITE_LOCK.lock() else {
-            return;
-        };
-        let dir = CoverPaths::app_dir();
-        if fs::create_dir_all(&dir).is_err() {
-            return;
+        if let Ok(json) = serde_json::to_vec_pretty(data) {
+            let _ = save_atomic_locked(
+                &WRITE_LOCK,
+                &Self::file_path(),
+                Some(&Self::backup_path()),
+                &json,
+            );
         }
-        let path = Self::file_path();
-        let backup = Self::backup_path();
-        let tmp = CoverPaths::app_dir().join("native-collections.json.tmp");
-        let Ok(json) = serde_json::to_string_pretty(data) else {
-            return;
-        };
-        if fs::write(&tmp, json).is_err() {
-            return;
-        }
-        if path.exists() {
-            let _ = fs::copy(&path, &backup);
-        }
-        let _ = fs::rename(&tmp, &path);
     }
 }
 
@@ -183,7 +158,12 @@ fn de_usize_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> 
             .map(|x| x as usize)
             .or_else(|| n.as_i64().filter(|&x| x > 0).map(|x| x as usize))
             .unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<isize>().ok().filter(|&x| x > 0).unwrap_or(0) as usize,
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<isize>()
+            .ok()
+            .filter(|&x| x > 0)
+            .unwrap_or(0) as usize,
         _ => 0,
     })
 }

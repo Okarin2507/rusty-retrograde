@@ -9,7 +9,9 @@ use iced::{Color, Element, Length};
 use crate::icon_paths::ICONS;
 
 thread_local! {
-    static CACHE: RefCell<HashMap<(String, bool), svg::Handle>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<&'static str, svg::Handle>> = RefCell::new(HashMap::new());
+    static HEX_CACHE: RefCell<[Option<svg::Handle>; 4]> = const { RefCell::new([None, None, None, None]) };
+    static CARD_PLAY_CACHE: RefCell<[Option<svg::Handle>; 2]> = const { RefCell::new([None, None]) };
 }
 
 /// Icons the original draws as solid shapes rather than outlines.
@@ -18,12 +20,12 @@ fn is_filled(name: &str) -> bool {
 }
 
 pub(crate) fn handle(name: &str) -> svg::Handle {
-    let filled = is_filled(name);
+    let &(key, d) = ICONS.iter().find(|(n, _)| *n == name).unwrap_or(&("", ""));
+    let filled = is_filled(key);
     CACHE.with(|c| {
         c.borrow_mut()
-            .entry((name.to_owned(), filled))
+            .entry(key)
             .or_insert_with(|| {
-                let d = ICONS.iter().find(|(n, _)| *n == name).map_or("", |(_, d)| *d);
                 let fill = if filled { "white" } else { "none" };
                 let doc = format!(
                     "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"{fill}\" stroke=\"white\" \
@@ -50,7 +52,11 @@ pub fn icon_hover<'a, M: 'a>(name: &str, size: f32, color: Color, hover: Color) 
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
         .style(move |_t, status| svg::Style {
-            color: Some(if matches!(status, svg::Status::Hovered) { hover } else { color }),
+            color: Some(if matches!(status, svg::Status::Hovered) {
+                hover
+            } else {
+                color
+            }),
         })
         .into()
 }
@@ -58,11 +64,11 @@ pub fn icon_hover<'a, M: 'a>(name: &str, size: f32, color: Color, hover: Color) 
 /// The hexagon of the transport button (`ShapeHex` of the original) with a play or pause glyph:
 /// off-white, or white while hovered.
 pub(crate) fn hex_play_handle(playing: bool, hovered: bool) -> svg::Handle {
-    let key = format!("hex{}{}", if playing { "pause" } else { "play" }, if hovered { "-hover" } else { "" });
-    CACHE.with(|c| {
-        c.borrow_mut()
-            .entry((key, false))
-            .or_insert_with(|| {
+    let slot = usize::from(playing) * 2 + usize::from(hovered);
+    HEX_CACHE.with(|c| {
+        let mut arr = c.borrow_mut();
+        arr[slot]
+            .get_or_insert_with(|| {
                 let hex = "M16,0 L48,0 L64,28 L48,56 L16,56 L0,28 Z";
                 let glyph = if playing {
                     "M24,17 H30 V39 H24 Z M34,17 H40 V39 H34 Z"
@@ -89,11 +95,11 @@ pub fn hex_play<'a, M: Clone + 'a>(playing: bool, width: f32) -> Element<'a, M> 
 /// The 40 px play button of an album card (`ShapeCardPlay` of the original: a square with two cut
 /// corners), off-white or white while hovered, with a black play glyph.
 pub(crate) fn card_play_handle(hovered: bool) -> svg::Handle {
-    let key = if hovered { "cardplay-hover" } else { "cardplay" }.to_owned();
-    CACHE.with(|c| {
-        c.borrow_mut()
-            .entry((key, false))
-            .or_insert_with(|| {
+    let slot = usize::from(hovered);
+    CARD_PLAY_CACHE.with(|c| {
+        let mut arr = c.borrow_mut();
+        arr[slot]
+            .get_or_insert_with(|| {
                 let shape = "M8,0 L40,0 L40,32 L32,40 L0,40 L0,8 Z";
                 let play = ICONS.iter().find(|(n, _)| *n == "play").map_or("", |(_, d)| *d);
                 let fill = if hovered { "#FFFFFF" } else { "#ECE9E1" };

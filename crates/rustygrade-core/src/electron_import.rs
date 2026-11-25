@@ -8,11 +8,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::collections::{CollectionsData, PlaylistData};
+
+const MAX_SNAPPY_UNCOMPRESSED: usize = 64 * 1024 * 1024;
 
 /// `$XDG_CONFIG_HOME/{retrograde,Retrograde}/Local Storage/leveldb` (.NET's `ApplicationData`
 /// on Linux, which is where the C# build looked), falling back to `~/.config`.
@@ -35,9 +36,12 @@ pub fn try_read() -> Option<CollectionsData> {
 /// Reads `my_playlists` and `liked_songs` from the LevelDB in `dir`. `None` when neither key is
 /// there or their JSON does not parse (the C# build gave up on the whole import then too).
 pub fn try_read_from(dir: &Path) -> Option<CollectionsData> {
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = read_leveldb(dir).into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut playlists_json = None;
     let mut liked_json = None;
-    for (key, raw) in read_leveldb(dir) {
+    for (key, raw) in entries {
         // Chromium key: "_<origin>\0\x01<name>"; value: 0x00 + UTF-16LE or 0x01 + Latin-1.
         if !key.starts_with(b"_") {
             continue;
@@ -68,9 +72,15 @@ pub fn try_read_from(dir: &Path) -> Option<CollectionsData> {
     }
     if let Some(json) = playlists_json {
         let doc: Value = serde_json::from_str(&json).ok()?;
+        let mut next_fallback_id = crate::now_ms().max(1);
         for pl in doc.as_array()? {
+            let id = pl.get("id").and_then(Value::as_i64).unwrap_or_else(|| {
+                let assigned = next_fallback_id;
+                next_fallback_id = next_fallback_id.saturating_add(1);
+                assigned
+            });
             let mut p = PlaylistData {
-                id: pl.get("id").and_then(Value::as_i64).unwrap_or_else(now_ms),
+                id,
                 name: pl
                     .get("name")
                     .and_then(Value::as_str)
@@ -98,19 +108,17 @@ pub fn try_read_from(dir: &Path) -> Option<CollectionsData> {
     Some(data)
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// `filePath` first: some Electron entries carry ids with a timestamp suffix.
 fn track_id(t: &Value) -> Option<String> {
     let obj = t.as_object()?;
     obj.get("filePath")
         .and_then(Value::as_str)
-        .or_else(|| obj.get("id").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            obj.get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
         .map(str::to_owned)
 }
 
@@ -179,6 +187,7 @@ pub fn read_leveldb(dir: &Path) -> HashMap<Vec<u8>, Vec<u8>> {
 fn read_log(data: &[u8], newest: &mut Newest) {
     const BLOCK: usize = 32768;
     let mut pending: Vec<u8> = Vec::new();
+    let mut in_fragment = false;
     let mut pos = 0usize;
     while pos + 7 <= data.len() {
         let left = BLOCK - pos % BLOCK;
@@ -190,7 +199,7 @@ fn read_log(data: &[u8], newest: &mut Newest) {
         let kind = data[pos + 6];
         let start = pos + 7;
         if kind == 0 && len == 0 {
-            pos += left; // zero padding
+            pos += left;
             continue;
         }
         let Some(payload) = data.get(start..start + len) else {
@@ -200,18 +209,24 @@ fn read_log(data: &[u8], newest: &mut Newest) {
             1 => {
                 apply_batch(payload, newest);
                 pending.clear();
+                in_fragment = false;
             }
             2 => {
                 pending.clear();
                 pending.extend_from_slice(payload);
+                in_fragment = true;
             }
-            3 => pending.extend_from_slice(payload),
-            4 => {
+            3 if in_fragment => pending.extend_from_slice(payload),
+            4 if in_fragment => {
                 pending.extend_from_slice(payload);
                 apply_batch(&pending, newest);
                 pending.clear();
+                in_fragment = false;
             }
-            _ => {}
+            _ => {
+                pending.clear();
+                in_fragment = false;
+            }
         }
         pos = start + len;
     }
@@ -248,7 +263,6 @@ fn read_table(data: &[u8], newest: &mut Newest) {
         return;
     };
     let mut p = 0usize;
-    // metaindex handle, then index handle
     let (Some(_), Some(_), Some(idx_off), Some(idx_size)) = (
         read_varint(footer, &mut p),
         read_varint(footer, &mut p),
@@ -262,7 +276,8 @@ fn read_table(data: &[u8], newest: &mut Newest) {
     };
     for (_, handle) in block_entries(&index) {
         let mut hp = 0usize;
-        let (Some(off), Some(size)) = (read_varint(&handle, &mut hp), read_varint(&handle, &mut hp))
+        let (Some(off), Some(size)) =
+            (read_varint(&handle, &mut hp), read_varint(&handle, &mut hp))
         else {
             continue;
         };
@@ -344,20 +359,25 @@ fn read_varint(b: &[u8], p: &mut usize) -> Option<u64> {
     while shift < 64 {
         let x = *b.get(*p)?;
         *p += 1;
+        if shift == 63 && x > 1 {
+            return None;
+        }
         result |= u64::from(x & 0x7F) << shift;
         if x & 0x80 == 0 {
             return Some(result);
         }
         shift += 7;
     }
-    Some(result)
+    None
 }
 
 /// Raw Snappy block format (no framing), as LevelDB stores compressed blocks.
 fn snappy_decompress(src: &[u8]) -> Option<Vec<u8>> {
     let mut p = 0usize;
     let len = usize::try_from(read_varint(src, &mut p)?).ok()?;
-    // A corrupt header must not make us allocate gigabytes up front.
+    if len > MAX_SNAPPY_UNCOMPRESSED {
+        return None;
+    }
     let mut dst: Vec<u8> = Vec::with_capacity(len.min(src.len().saturating_mul(32)));
     while p < src.len() && dst.len() < len {
         let tag = src[p];
@@ -367,7 +387,7 @@ fn snappy_decompress(src: &[u8]) -> Option<Vec<u8>> {
                 let mut n = (tag >> 2) as usize;
                 if n >= 60 {
                     let extra = n - 59;
-                    let bytes = src.get(p..p + extra)?;
+                    let bytes = src.get(p..p.checked_add(extra)?)?;
                     p += extra;
                     n = bytes
                         .iter()
@@ -375,6 +395,9 @@ fn snappy_decompress(src: &[u8]) -> Option<Vec<u8>> {
                         .fold(0usize, |acc, (i, &b)| acc | (b as usize) << (8 * i));
                 }
                 let n = n.checked_add(1)?;
+                if dst.len().checked_add(n)? > len {
+                    return None;
+                }
                 dst.extend_from_slice(src.get(p..p.checked_add(n)?)?);
                 p += n;
                 continue;
@@ -398,22 +421,22 @@ fn snappy_decompress(src: &[u8]) -> Option<Vec<u8>> {
                 (n, u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
             }
         };
-        if off == 0 || off > dst.len() {
+        if off == 0 || off > dst.len() || dst.len().checked_add(n)? > len {
             return None;
         }
-        // Overlapping copies are allowed (run-length style), so copy byte by byte.
         let s = dst.len() - off;
         for i in 0..n {
             let byte = dst[s + i];
             dst.push(byte);
         }
     }
-    Some(dst)
+    (dst.len() == len).then_some(dst)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::TempDir;
 
     fn varint(mut v: u64, out: &mut Vec<u8>) {
         while v >= 0x80 {
@@ -428,7 +451,6 @@ mod tests {
         out.extend_from_slice(s);
     }
 
-    /// A log file with one full record holding one WriteBatch. `None` value = delete.
     fn log_file(seq: u64, ops: &[(&[u8], Option<&[u8]>)]) -> Vec<u8> {
         let mut batch = Vec::new();
         batch.extend_from_slice(&seq.to_le_bytes());
@@ -440,14 +462,13 @@ mod tests {
                 slice(v, &mut batch);
             }
         }
-        let mut out = vec![0, 0, 0, 0]; // CRC, not checked
+        let mut out = vec![0, 0, 0, 0];
         out.extend_from_slice(&(batch.len() as u16).to_le_bytes());
-        out.push(1); // full record
+        out.push(1);
         out.extend_from_slice(&batch);
         out
     }
 
-    /// Snappy with literals only (valid, just not compressed).
     fn snappy_literal(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         varint(data.len() as u64, &mut out);
@@ -467,15 +488,13 @@ mod tests {
             out.extend_from_slice(k);
             out.extend_from_slice(v);
         }
-        out.extend_from_slice(&0u32.to_le_bytes()); // restart[0]
-        out.extend_from_slice(&1u32.to_le_bytes()); // restart count
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
         out
     }
 
-    /// (user key, sequence, value); `None` = deletion.
     type Entry<'a> = (&'a [u8], u64, Option<&'a [u8]>);
 
-    /// A table with one Snappy data block of entries.
     fn table_file(entries: &[Entry]) -> Vec<u8> {
         let ikeys: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
@@ -488,15 +507,15 @@ mod tests {
             .collect();
         let data_block = snappy_literal(&block(&ikeys));
         let mut file = data_block.clone();
-        file.push(1); // snappy
-        file.extend_from_slice(&[0; 4]); // CRC
+        file.push(1);
+        file.extend_from_slice(&[0; 4]);
         let mut handle = Vec::new();
         varint(0, &mut handle);
         varint(data_block.len() as u64, &mut handle);
         let index = block(&[(b"zzzz".to_vec(), handle)]);
         let index_off = file.len();
         file.extend_from_slice(&index);
-        file.push(0); // uncompressed
+        file.push(0);
         file.extend_from_slice(&[0; 4]);
         let mut footer = Vec::new();
         varint(0, &mut footer);
@@ -509,28 +528,16 @@ mod tests {
         file
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "retro-leveldb-test-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn snappy_overlapping_copy() {
-        // len 7, literal "ab", copy-1 len 5 offset 2 -> "abababa"
         let src = [7, 0x04, b'a', b'b', (1 << 2) | 1, 2];
         assert_eq!(snappy_decompress(&src).unwrap(), b"abababa");
-        // copy before any output is rejected, not a panic
         assert_eq!(snappy_decompress(&[4, 0x01, 1]), None);
     }
 
     #[test]
     fn log_overrides_table_and_deletes() {
-        let dir = temp_dir("merge");
+        let dir = TempDir::new("leveldb-merge");
         fs::write(
             dir.join("000005.ldb"),
             table_file(&[
@@ -542,44 +549,53 @@ mod tests {
         .unwrap();
         fs::write(
             dir.join("000006.log"),
-            log_file(10, &[(b"a", Some(b"new")), (b"c", None), (b"d", Some(b"log"))]),
+            log_file(
+                10,
+                &[(b"a", Some(b"new")), (b"c", None), (b"d", Some(b"log"))],
+            ),
         )
         .unwrap();
         fs::write(dir.join("LOCK"), b"").unwrap();
         let all = read_leveldb(&dir);
-        let _ = fs::remove_dir_all(&dir);
-        assert_eq!(all.get(b"a".as_slice()).map(Vec::as_slice), Some(b"new".as_slice()));
-        assert_eq!(all.get(b"b".as_slice()).map(Vec::as_slice), Some(b"kept".as_slice()));
-        assert_eq!(all.get(b"d".as_slice()).map(Vec::as_slice), Some(b"log".as_slice()));
+        assert_eq!(
+            all.get(b"a".as_slice()).map(Vec::as_slice),
+            Some(b"new".as_slice())
+        );
+        assert_eq!(
+            all.get(b"b".as_slice()).map(Vec::as_slice),
+            Some(b"kept".as_slice())
+        );
+        assert_eq!(
+            all.get(b"d".as_slice()).map(Vec::as_slice),
+            Some(b"log".as_slice())
+        );
         assert!(!all.contains_key(b"c".as_slice()));
         assert_eq!(all.len(), 3);
     }
 
     #[test]
     fn damaged_files_do_not_panic() {
-        let dir = temp_dir("damaged");
+        let dir = TempDir::new("leveldb-damaged");
         fs::write(dir.join("000001.ldb"), [0xff; 60]).unwrap();
         fs::write(dir.join("000002.log"), [0, 0, 0, 0, 0xff, 0xff, 1, 3]).unwrap();
         let mut log = log_file(1, &[(b"x", Some(b"y"))]);
         log.truncate(log.len() - 1);
         fs::write(dir.join("000003.log"), log).unwrap();
-        let all = read_leveldb(&dir);
-        let _ = fs::remove_dir_all(&dir);
-        assert!(all.is_empty());
+        assert!(read_leveldb(&dir).is_empty());
     }
 
     #[test]
     fn imports_chromium_local_storage() {
-        let dir = temp_dir("import");
+        let dir = TempDir::new("leveldb-import");
         let playlists = r#"[{"id": 42, "name": "Road", "coverArt": "FILE:///c.jpg",
             "tracks": [{"filePath": "/m/1.flac", "id": "/m/1.flac123"}, {"id": "/m/2.flac"},
                        {"filePath": "/m/1.flac"}, 5]},
-            {"name": "No id", "coverArt": "https://x/y.jpg"}]"#;
-        // Latin-1 value (prefix 0x01)
+            {"name": "No id", "coverArt": "https://x/y.jpg"},
+            {"name": "No id 2"}]"#;
         let mut pl_value = vec![1u8];
         pl_value.extend_from_slice(playlists.as_bytes());
-        // UTF-16LE value (prefix 0x00) with a non-ASCII path
-        let liked = r#"[{"filePath": "/m/Café.flac"}, {"id": "/m/3.flac"}, {"filePath": "/m/Café.flac"}]"#;
+        let liked =
+            r#"[{"filePath": "/m/Café.flac"}, {"id": "/m/3.flac"}, {"filePath": "/m/Café.flac"}]"#;
         let mut liked_value = vec![0u8];
         for u in liked.encode_utf16() {
             liked_value.extend_from_slice(&u.to_le_bytes());
@@ -597,21 +613,21 @@ mod tests {
         )
         .unwrap();
         let data = try_read_from(&dir).expect("import");
-        let empty = temp_dir("import-empty");
-        let none = try_read_from(&empty);
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&empty);
+        let empty = TempDir::new("leveldb-empty");
+        assert!(try_read_from(&empty).is_none());
 
-        assert!(none.is_none());
-        assert_eq!(data.imported_from.as_deref(), Some(dir.to_string_lossy().as_ref()));
+        assert_eq!(
+            data.imported_from.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
         assert_eq!(data.liked, vec!["/m/Café.flac", "/m/3.flac"]);
-        assert_eq!(data.playlists.len(), 2);
+        assert_eq!(data.playlists.len(), 3);
         let p = &data.playlists[0];
         assert_eq!((p.id, p.name.as_str()), (42, "Road"));
         assert_eq!(p.cover_art.as_deref(), Some("FILE:///c.jpg"));
         assert_eq!(p.track_ids, vec!["/m/1.flac", "/m/2.flac"]);
-        let q = &data.playlists[1];
-        assert!(q.id > 0 && q.cover_art.is_none() && q.track_ids.is_empty());
+        assert!(data.playlists[1].id > 0 && data.playlists[1].cover_art.is_none());
+        assert_ne!(data.playlists[1].id, data.playlists[2].id);
         assert!(data.smart.is_none());
     }
 }

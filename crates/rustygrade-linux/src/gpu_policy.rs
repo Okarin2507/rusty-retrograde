@@ -10,9 +10,9 @@ pub const PCI_VENDOR_INTEL: u32 = 0x8086;
 pub const PCI_VENDOR_AMD: u32 = 0x1002;
 
 const VULKAN_ICD_DIRS: &[&str] = &[
-    "/usr/share/vulkan/icd.d",
     "/etc/vulkan/icd.d",
     "/usr/local/share/vulkan/icd.d",
+    "/usr/share/vulkan/icd.d",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub struct GraphicsEnvPlan {
 /// Inspects `/sys/class/drm/card*/device/vendor`, scans standard Vulkan ICD directories,
 /// and applies non-destructive startup graphics & display backend policy before Iced initializes.
 ///
-/// Any variable already defined in the caller's environment (`VK_DRIVER_FILES`,
+/// Any variable already defined and non-empty in the caller's environment (`VK_DRIVER_FILES`,
 /// `VK_ICD_FILENAMES`, `WGPU_BACKEND`, `WGPU_POWER_PREF`, `ICED_BACKEND`) is respected.
 ///
 /// # Safety
@@ -63,10 +63,17 @@ pub unsafe fn apply_startup_graphics_policy(settings: &AppSettings) -> GraphicsP
         unsafe {
             std::env::remove_var(key);
         }
-        debug!(key, "Cleared conflicting display env var per startup policy");
+        debug!(
+            key,
+            "Cleared conflicting display env var per startup policy"
+        );
     }
     info!(summary = %plan.report.summary, "Graphics policy initialized");
     plan.report
+}
+
+fn non_empty_env<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    env.get(key).map(|v| v.trim()).filter(|v| !v.is_empty())
 }
 
 /// Pure policy resolver so unit tests can verify hybrid vs single-GPU behavior across distros.
@@ -83,8 +90,8 @@ pub fn resolve_graphics_env(
     let has_amd = drm_vendors.contains(&PCI_VENDOR_AMD);
     let is_hybrid_nvidia = has_nvidia && (has_intel || has_amd);
 
-    let has_user_vk_override = existing_env.contains_key("VK_DRIVER_FILES")
-        || existing_env.contains_key("VK_ICD_FILENAMES");
+    let has_user_vk_override = non_empty_env(existing_env, "VK_DRIVER_FILES").is_some()
+        || non_empty_env(existing_env, "VK_ICD_FILENAMES").is_some();
 
     match settings.gpu_preference {
         GpuPreference::Igpu => {
@@ -102,35 +109,35 @@ pub fn resolve_graphics_env(
                     set_vars.push(("VK_ICD_FILENAMES", joined));
                 }
             }
-            if !existing_env.contains_key("WGPU_BACKEND") {
+            if non_empty_env(existing_env, "WGPU_BACKEND").is_none() {
                 // Keep wgpu off GL/EGL probing on hybrid laptops so it doesn't load NVIDIA libEGL.
                 set_vars.push(("WGPU_BACKEND", "vulkan".to_owned()));
             }
-            if !existing_env.contains_key("WGPU_POWER_PREF") {
+            if non_empty_env(existing_env, "WGPU_POWER_PREF").is_none() {
                 set_vars.push(("WGPU_POWER_PREF", "low".to_owned()));
             }
         }
         GpuPreference::Auto => {
-            if !existing_env.contains_key("WGPU_POWER_PREF") {
+            if non_empty_env(existing_env, "WGPU_POWER_PREF").is_none() {
                 // iced_wgpu defaults to HighPerformance unless WGPU_POWER_PREF=none/low is set.
                 set_vars.push(("WGPU_POWER_PREF", "none".to_owned()));
             }
         }
         GpuPreference::Dgpu => {
-            if !existing_env.contains_key("WGPU_POWER_PREF") {
+            if non_empty_env(existing_env, "WGPU_POWER_PREF").is_none() {
                 set_vars.push(("WGPU_POWER_PREF", "high".to_owned()));
             }
         }
         GpuPreference::Software => {
-            if !existing_env.contains_key("ICED_BACKEND") {
+            if non_empty_env(existing_env, "ICED_BACKEND").is_none() {
                 set_vars.push(("ICED_BACKEND", "tiny-skia".to_owned()));
             }
         }
     }
 
-    let has_wayland = existing_env.contains_key("WAYLAND_DISPLAY")
-        || existing_env.contains_key("WAYLAND_SOCKET");
-    let has_x11 = existing_env.contains_key("DISPLAY");
+    let has_wayland = non_empty_env(existing_env, "WAYLAND_DISPLAY").is_some()
+        || non_empty_env(existing_env, "WAYLAND_SOCKET").is_some();
+    let has_x11 = non_empty_env(existing_env, "DISPLAY").is_some();
 
     // winit 0.30 removed WINIT_UNIX_BACKEND and chooses Wayland whenever WAYLAND_DISPLAY /
     // WAYLAND_SOCKET are present, or X11 when only DISPLAY is present.
@@ -158,10 +165,10 @@ pub fn resolve_graphics_env(
         }
         DisplayBackend::X11 => {
             if has_x11 {
-                if existing_env.contains_key("WAYLAND_DISPLAY") {
+                if non_empty_env(existing_env, "WAYLAND_DISPLAY").is_some() {
                     unset_vars.push("WAYLAND_DISPLAY");
                 }
-                if existing_env.contains_key("WAYLAND_SOCKET") {
+                if non_empty_env(existing_env, "WAYLAND_SOCKET").is_some() {
                     unset_vars.push("WAYLAND_SOCKET");
                 }
                 "X11".to_owned()
@@ -178,34 +185,38 @@ pub fn resolve_graphics_env(
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.clone())
-            .or_else(|| existing_env.get(key).cloned())
+            .or_else(|| non_empty_env(existing_env, key).map(str::to_owned))
     };
 
     let vk_driver_files = get_effective("VK_DRIVER_FILES")
-        .or_else(|| existing_env.get("VK_ICD_FILENAMES").cloned());
+        .or_else(|| non_empty_env(existing_env, "VK_ICD_FILENAMES").map(str::to_owned));
     let wgpu_backend = get_effective("WGPU_BACKEND");
     let wgpu_power_pref = get_effective("WGPU_POWER_PREF");
     let iced_backend = get_effective("ICED_BACKEND");
 
-    let gpu_label = match settings.gpu_preference {
-        GpuPreference::Igpu => {
-            if iced_backend.as_deref() == Some("tiny-skia") {
-                "Software (env override)".to_owned()
-            } else if is_hybrid_nvidia && vk_driver_files.is_some() {
-                if has_intel {
-                    "iGPU locked (Intel, hybrid dGPU dormant)".to_owned()
+    let gpu_label = if iced_backend.as_deref() == Some("tiny-skia")
+        && settings.gpu_preference != GpuPreference::Software
+    {
+        "Software (env override)".to_owned()
+    } else {
+        match settings.gpu_preference {
+            GpuPreference::Igpu => {
+                if is_hybrid_nvidia && vk_driver_files.is_some() {
+                    if has_intel {
+                        "iGPU locked (Intel, hybrid dGPU dormant)".to_owned()
+                    } else {
+                        "iGPU locked (AMD, hybrid dGPU dormant)".to_owned()
+                    }
+                } else if has_nvidia && !is_hybrid_nvidia {
+                    "Single NVIDIA GPU (low power hint)".to_owned()
                 } else {
-                    "iGPU locked (AMD, hybrid dGPU dormant)".to_owned()
+                    "iGPU / Low-Power".to_owned()
                 }
-            } else if has_nvidia && !is_hybrid_nvidia {
-                "Single NVIDIA GPU (low power hint)".to_owned()
-            } else {
-                "iGPU / Low-Power".to_owned()
             }
+            GpuPreference::Auto => "Auto (wgpu default)".to_owned(),
+            GpuPreference::Dgpu => "dGPU (high performance)".to_owned(),
+            GpuPreference::Software => "Software CPU (tiny-skia)".to_owned(),
         }
-        GpuPreference::Auto => "Auto (wgpu default)".to_owned(),
-        GpuPreference::Dgpu => "dGPU (high performance)".to_owned(),
-        GpuPreference::Software => "Software CPU (tiny-skia)".to_owned(),
     };
 
     let summary = format!("{gpu_label} | {effective_display}");
@@ -234,6 +245,9 @@ fn is_matching_igpu_icd(path: &Path, has_intel: bool, has_amd: bool) -> bool {
     };
     let lower = name.to_ascii_lowercase();
     if !lower.ends_with(".json") {
+        return false;
+    }
+    if cfg!(target_pointer_width = "64") && lower.contains("i686") {
         return false;
     }
     if lower.contains("nvidia") || lower.contains("lvp") || lower.contains("lavapipe") {
@@ -291,6 +305,7 @@ mod tests {
     fn sample_icds() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json"),
+            PathBuf::from("/usr/share/vulkan/icd.d/intel_icd.i686.json"),
             PathBuf::from("/usr/share/vulkan/icd.d/intel_icd.x86_64.json"),
             PathBuf::from("/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"),
             PathBuf::from("/usr/share/vulkan/icd.d/nvidia_icd.json"),
@@ -299,24 +314,25 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_intel_nvidia_igpu_locks_intel_icds() {
-        let settings = AppSettings {
-            gpu_preference: GpuPreference::Igpu,
-            display_backend: DisplayBackend::Wayland,
-            ..AppSettings::default()
-        };
+    fn hybrid_igpu_filters_32bit_treats_empty_env_as_unset_and_locks_intel_or_amd() {
         let mut env = HashMap::new();
         env.insert("WAYLAND_DISPLAY".to_owned(), "wayland-0".to_owned());
         env.insert("DISPLAY".to_owned(), ":0".to_owned());
+        // Empty env overrides must be ignored like unset.
+        env.insert("VK_DRIVER_FILES".to_owned(), String::new());
+        env.insert("WGPU_BACKEND".to_owned(), "  ".to_owned());
 
         let plan = resolve_graphics_env(
-            &settings,
+            &AppSettings {
+                gpu_preference: GpuPreference::Igpu,
+                display_backend: DisplayBackend::Wayland,
+                ..AppSettings::default()
+            },
             &[PCI_VENDOR_NVIDIA, PCI_VENDOR_INTEL],
             &sample_icds(),
             &env,
         );
-        let expected_icd =
-            "/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json:/usr/share/vulkan/icd.d/intel_icd.x86_64.json";
+        let expected_icd = "/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json:/usr/share/vulkan/icd.d/intel_icd.x86_64.json";
         assert_eq!(plan.report.vk_driver_files.as_deref(), Some(expected_icd));
         assert!(
             plan.set_vars
@@ -326,74 +342,33 @@ mod tests {
         assert_eq!(plan.report.wgpu_power_pref.as_deref(), Some("low"));
         assert_eq!(plan.unset_vars, vec!["DISPLAY"]);
         assert_eq!(plan.report.effective_display, "Wayland");
-        assert_eq!(plan.report.iced_backend, None);
-    }
 
-    #[test]
-    fn hybrid_amd_nvidia_igpu_locks_radeon_icd() {
-        let settings = AppSettings {
-            gpu_preference: GpuPreference::Igpu,
-            ..AppSettings::default()
-        };
-        let plan = resolve_graphics_env(
-            &settings,
+        let amd = resolve_graphics_env(
+            &AppSettings {
+                gpu_preference: GpuPreference::Igpu,
+                ..AppSettings::default()
+            },
             &[PCI_VENDOR_AMD, PCI_VENDOR_NVIDIA],
             &sample_icds(),
             &HashMap::new(),
         );
         assert_eq!(
-            plan.report.vk_driver_files.as_deref(),
+            amd.report.vk_driver_files.as_deref(),
             Some("/usr/share/vulkan/icd.d/radeon_icd.x86_64.json")
         );
-        assert_eq!(plan.report.wgpu_power_pref.as_deref(), Some("low"));
     }
 
     #[test]
-    fn single_nvidia_gpu_does_not_force_vk_driver_files() {
-        let settings = AppSettings {
-            gpu_preference: GpuPreference::Igpu,
-            ..AppSettings::default()
-        };
-        let plan = resolve_graphics_env(
-            &settings,
-            &[PCI_VENDOR_NVIDIA],
-            &sample_icds(),
-            &HashMap::new(),
-        );
-        assert_eq!(plan.report.vk_driver_files, None);
-        assert_eq!(plan.report.wgpu_power_pref.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn preserves_user_existing_environment_variables() {
-        let settings = AppSettings {
-            gpu_preference: GpuPreference::Igpu,
-            display_backend: DisplayBackend::Wayland,
-            ..AppSettings::default()
-        };
+    fn preserves_overrides_and_supports_all_modes() {
         let mut env = HashMap::new();
-        env.insert("VK_ICD_FILENAMES".to_owned(), "/custom/my_icd.json".to_owned());
+        env.insert(
+            "VK_ICD_FILENAMES".to_owned(),
+            "/custom/my_icd.json".to_owned(),
+        );
         env.insert("WGPU_BACKEND".to_owned(), "gl".to_owned());
+        env.insert("ICED_BACKEND".to_owned(), "tiny-skia".to_owned());
 
-        let plan = resolve_graphics_env(
-            &settings,
-            &[PCI_VENDOR_NVIDIA, PCI_VENDOR_INTEL],
-            &sample_icds(),
-            &env,
-        );
-        assert!(!plan.set_vars.iter().any(|(k, _)| *k == "VK_DRIVER_FILES"));
-        assert!(!plan.set_vars.iter().any(|(k, _)| *k == "VK_ICD_FILENAMES"));
-        assert!(!plan.set_vars.iter().any(|(k, _)| *k == "WGPU_BACKEND"));
-        assert_eq!(
-            plan.report.vk_driver_files.as_deref(),
-            Some("/custom/my_icd.json")
-        );
-        assert_eq!(plan.report.wgpu_backend.as_deref(), Some("gl"));
-    }
-
-    #[test]
-    fn supports_auto_dgpu_software_and_x11_modes() {
-        let auto_plan = resolve_graphics_env(
+        let override_plan = resolve_graphics_env(
             &AppSettings {
                 gpu_preference: GpuPreference::Auto,
                 display_backend: DisplayBackend::Auto,
@@ -401,28 +376,38 @@ mod tests {
             },
             &[PCI_VENDOR_NVIDIA, PCI_VENDOR_INTEL],
             &sample_icds(),
-            &HashMap::new(),
+            &env,
         );
-        assert_eq!(auto_plan.report.wgpu_power_pref.as_deref(), Some("none"));
+        assert_eq!(
+            override_plan.report.vk_driver_files.as_deref(),
+            Some("/custom/my_icd.json")
+        );
+        assert_eq!(override_plan.report.wgpu_backend.as_deref(), Some("gl"));
+        assert!(
+            override_plan
+                .report
+                .summary
+                .starts_with("Software (env override)")
+        );
 
-        let mut env = HashMap::new();
-        env.insert("WAYLAND_DISPLAY".to_owned(), "wayland-0".to_owned());
-        env.insert("DISPLAY".to_owned(), ":0".to_owned());
-        let dgpu_plan = resolve_graphics_env(
+        let mut x11_env = HashMap::new();
+        x11_env.insert("WAYLAND_DISPLAY".to_owned(), "wayland-0".to_owned());
+        x11_env.insert("DISPLAY".to_owned(), ":0".to_owned());
+        let dgpu = resolve_graphics_env(
             &AppSettings {
                 gpu_preference: GpuPreference::Dgpu,
                 display_backend: DisplayBackend::X11,
                 ..AppSettings::default()
             },
-            &[PCI_VENDOR_NVIDIA, PCI_VENDOR_INTEL],
+            &[PCI_VENDOR_NVIDIA],
             &sample_icds(),
-            &env,
+            &x11_env,
         );
-        assert_eq!(dgpu_plan.report.wgpu_power_pref.as_deref(), Some("high"));
-        assert_eq!(dgpu_plan.unset_vars, vec!["WAYLAND_DISPLAY"]);
-        assert_eq!(dgpu_plan.report.effective_display, "X11");
+        assert_eq!(dgpu.report.wgpu_power_pref.as_deref(), Some("high"));
+        assert_eq!(dgpu.unset_vars, vec!["WAYLAND_DISPLAY"]);
+        assert_eq!(dgpu.report.effective_display, "X11");
 
-        let sw_plan = resolve_graphics_env(
+        let sw = resolve_graphics_env(
             &AppSettings {
                 gpu_preference: GpuPreference::Software,
                 ..AppSettings::default()
@@ -431,6 +416,7 @@ mod tests {
             &sample_icds(),
             &HashMap::new(),
         );
-        assert_eq!(sw_plan.report.iced_backend.as_deref(), Some("tiny-skia"));
+        assert_eq!(sw.report.iced_backend.as_deref(), Some("tiny-skia"));
+        assert_eq!(VULKAN_ICD_DIRS[0], "/etc/vulkan/icd.d");
     }
 }

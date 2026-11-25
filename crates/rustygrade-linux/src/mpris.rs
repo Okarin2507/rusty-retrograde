@@ -53,16 +53,12 @@ impl Default for MprisState {
 /// A valid, unique MPRIS track id for a track id (its file path): a hash under the app's own
 /// namespace, since the spec reserves `/org/mpris` (C# used `/org/retrograde/track/...` too).
 pub fn track_object_path(track_id: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in track_id.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
+    let hash = crate::fnv1a_64(track_id.as_bytes());
     format!("/org/rustygrade/track/t{hash:016x}")
 }
 
 /// Positions further apart than this are a jump (seek, restart) and get a `Seeked` signal.
-const SEEK_JUMP_US: i64 = 2_000_000;
+const SEEK_JUMP_US: u64 = 2_000_000;
 
 impl MprisState {
     fn metadata_map(&self) -> HashMap<String, OwnedVariant> {
@@ -193,10 +189,10 @@ struct MediaPlayer2Player {
 }
 
 impl MediaPlayer2Player {
-    fn snapshot(&self) -> MprisState {
+    fn read_with<R>(&self, f: impl FnOnce(&MprisState) -> R) -> R {
         match self.state.read() {
-            Ok(g) => g.clone(),
-            Err(p) => p.into_inner().clone(),
+            Ok(g) => f(&g),
+            Err(p) => f(&p.into_inner()),
         }
     }
 }
@@ -205,12 +201,12 @@ impl MediaPlayer2Player {
 impl MediaPlayer2Player {
     #[zbus(property)]
     async fn playback_status(&self) -> String {
-        self.snapshot().playback_status
+        self.read_with(|s| s.playback_status.clone())
     }
 
     #[zbus(property)]
     async fn loop_status(&self) -> String {
-        self.snapshot().loop_status
+        self.read_with(|s| s.loop_status.clone())
     }
 
     #[zbus(property)]
@@ -228,7 +224,7 @@ impl MediaPlayer2Player {
 
     #[zbus(property)]
     async fn shuffle(&self) -> bool {
-        self.snapshot().shuffle
+        self.read_with(|s| s.shuffle)
     }
 
     #[zbus(property)]
@@ -238,16 +234,19 @@ impl MediaPlayer2Player {
 
     #[zbus(property)]
     async fn metadata(&self) -> HashMap<String, OwnedVariant> {
-        self.snapshot().metadata_map()
+        self.read_with(MprisState::metadata_map)
     }
 
     #[zbus(property)]
     async fn volume(&self) -> f64 {
-        self.snapshot().volume
+        self.read_with(|s| s.volume)
     }
 
     #[zbus(property)]
     async fn set_volume(&self, volume: f64) {
+        if !volume.is_finite() {
+            return;
+        }
         let _ = self
             .cmd_tx
             .send(MprisCommand::SetVolume(volume.clamp(0.0, 1.0)));
@@ -270,27 +269,27 @@ impl MediaPlayer2Player {
 
     #[zbus(property)]
     async fn can_go_next(&self) -> bool {
-        self.snapshot().can_go_next
+        self.read_with(|s| s.can_go_next)
     }
 
     #[zbus(property)]
     async fn can_go_previous(&self) -> bool {
-        self.snapshot().can_go_previous
+        self.read_with(|s| s.can_go_previous)
     }
 
     #[zbus(property)]
     async fn can_play(&self) -> bool {
-        self.snapshot().can_play
+        self.read_with(|s| s.can_play)
     }
 
     #[zbus(property)]
     async fn can_pause(&self) -> bool {
-        self.snapshot().can_pause
+        self.read_with(|s| s.can_pause)
     }
 
     #[zbus(property)]
     async fn can_seek(&self) -> bool {
-        self.snapshot().can_seek
+        self.read_with(|s| s.can_seek)
     }
 
     #[zbus(property)]
@@ -326,7 +325,10 @@ impl MediaPlayer2Player {
         let _ = self.cmd_tx.send(MprisCommand::SeekOffsetUs(offset));
     }
 
-    async fn set_position(&self, _track_id: OwnedObjectPath, position: i64) {
+    async fn set_position(&self, track_id: OwnedObjectPath, position: i64) {
+        if !position_matches_track(&self.state, track_id.as_str(), position) {
+            return;
+        }
         let _ = self.cmd_tx.send(MprisCommand::SetPositionUs(position));
     }
 
@@ -334,6 +336,55 @@ impl MediaPlayer2Player {
 
     #[zbus(signal)]
     async fn seeked(emitter: &SignalEmitter<'_>, position: i64) -> zbus::Result<()>;
+}
+
+fn position_matches_track(state: &RwLock<MprisState>, obj_path: &str, position_us: i64) -> bool {
+    if position_us < 0 {
+        return false;
+    }
+    let guard = state.read().unwrap_or_else(|p| p.into_inner());
+    let Some(id) = guard.track_id.as_deref() else {
+        return false;
+    };
+    if track_object_path(id) != obj_path {
+        return false;
+    }
+    guard.length_us <= 0 || position_us <= guard.length_us
+}
+
+struct StateDiff {
+    playback_status: bool,
+    metadata: bool,
+    volume: bool,
+    loop_status: bool,
+    shuffle: bool,
+    can_go_next: bool,
+    can_go_previous: bool,
+    can_play: bool,
+    can_pause: bool,
+    can_seek: bool,
+}
+
+impl StateDiff {
+    fn between(prev: &MprisState, next: &MprisState) -> Self {
+        Self {
+            playback_status: prev.playback_status != next.playback_status,
+            metadata: prev.track_id != next.track_id
+                || prev.title != next.title
+                || prev.artist != next.artist
+                || prev.album != next.album
+                || prev.art_url != next.art_url
+                || prev.length_us != next.length_us,
+            volume: (prev.volume - next.volume).abs() > 0.002,
+            loop_status: prev.loop_status != next.loop_status,
+            shuffle: prev.shuffle != next.shuffle,
+            can_go_next: prev.can_go_next != next.can_go_next,
+            can_go_previous: prev.can_go_previous != next.can_go_previous,
+            can_play: prev.can_play != next.can_play,
+            can_pause: prev.can_pause != next.can_pause,
+            can_seek: prev.can_seek != next.can_seek,
+        }
+    }
 }
 
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -380,30 +431,38 @@ impl MprisService {
     }
 
     /// Updates the live position. Emits `Seeked` only when it jumped by more than 2 s
-    /// (a seek or restart); ordinary playback progress is silent.
+    /// during active playback; ordinary progress and non-playing state are silent.
     pub async fn update_position(&self, position_us: i64) {
-        let prev = self.position_us.swap(position_us, Ordering::Relaxed);
-        if (position_us - prev).abs() > SEEK_JUMP_US {
-            self.emit_seeked(position_us).await;
+        let pos = position_us.max(0);
+        let prev = self.position_us.swap(pos, Ordering::Relaxed);
+        let is_playing = self
+            .state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .playback_status
+            == "Playing";
+        if is_playing && prev >= 0 && pos.abs_diff(prev) > SEEK_JUMP_US {
+            self.emit_seeked(pos).await;
         }
     }
 
     /// An explicit seek: stores the position and always emits `Seeked`.
     pub async fn seeked_to(&self, position_us: i64) {
-        self.position_us.store(position_us, Ordering::Relaxed);
-        self.emit_seeked(position_us).await;
+        let pos = position_us.max(0);
+        self.position_us.store(pos, Ordering::Relaxed);
+        self.emit_seeked(pos).await;
     }
 
     pub async fn update_state(&self, next: MprisState) {
-        self.position_us.store(next.position_us, Ordering::Relaxed);
-        let prev = {
+        self.position_us
+            .store(next.position_us.max(0), Ordering::Relaxed);
+        let diff = {
             let mut guard = match self.state.write() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let prev = guard.clone();
-            *guard = next.clone();
-            prev
+            let prev = std::mem::replace(&mut *guard, next);
+            StateDiff::between(&prev, &guard)
         };
 
         let Ok(iface) = self
@@ -417,34 +476,37 @@ impl MprisService {
         let emitter = iface.signal_emitter();
         let player = iface.get().await;
 
-        if prev.playback_status != next.playback_status
+        if diff.playback_status
             && let Err(e) = player.playback_status_changed(emitter).await
         {
             warn!(error = %e, "Failed emitting MPRIS PlaybackStatus change");
         }
-        if prev.track_id != next.track_id
-            || prev.title != next.title
-            || prev.artist != next.artist
-            || prev.album != next.album
-            || prev.art_url != next.art_url
-            || prev.length_us != next.length_us
-        {
+        if diff.metadata {
             let _ = player.metadata_changed(emitter).await;
         }
-        if (prev.volume - next.volume).abs() > 0.002 {
+        if diff.volume {
             let _ = player.volume_changed(emitter).await;
         }
-        if prev.loop_status != next.loop_status {
+        if diff.loop_status {
             let _ = player.loop_status_changed(emitter).await;
         }
-        if prev.shuffle != next.shuffle {
+        if diff.shuffle {
             let _ = player.shuffle_changed(emitter).await;
         }
-        if prev.can_go_next != next.can_go_next {
+        if diff.can_go_next {
             let _ = player.can_go_next_changed(emitter).await;
         }
-        if prev.can_go_previous != next.can_go_previous {
+        if diff.can_go_previous {
             let _ = player.can_go_previous_changed(emitter).await;
+        }
+        if diff.can_play {
+            let _ = player.can_play_changed(emitter).await;
+        }
+        if diff.can_pause {
+            let _ = player.can_pause_changed(emitter).await;
+        }
+        if diff.can_seek {
+            let _ = player.can_seek_changed(emitter).await;
         }
     }
 
@@ -455,7 +517,7 @@ impl MprisService {
             .interface::<_, MediaPlayer2Player>(MPRIS_PATH)
             .await
         {
-            let _ = MediaPlayer2Player::seeked(iface.signal_emitter(), position_us).await;
+            let _ = MediaPlayer2Player::seeked(iface.signal_emitter(), position_us.max(0)).await;
         }
     }
 }
@@ -476,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn trackid_is_valid_outside_mpris_namespace_and_unique() {
+    fn trackid_and_set_position_guards() {
         let ids = [
             "/music/Ado/01 唱.flac",
             "/music/Ado/01 踊.flac",
@@ -495,5 +557,17 @@ mod tests {
             assert!(seen.insert(path), "duplicate trackid for {id:?}");
         }
         assert!(MprisState::default().metadata_map().is_empty());
+
+        let state = RwLock::new(MprisState {
+            track_id: Some("/music/a.flac".to_owned()),
+            length_us: 10_000_000,
+            ..MprisState::default()
+        });
+        let valid_obj = track_object_path("/music/a.flac");
+        let wrong_obj = track_object_path("/music/b.flac");
+        assert!(position_matches_track(&state, &valid_obj, 5_000_000));
+        assert!(!position_matches_track(&state, &valid_obj, -1));
+        assert!(!position_matches_track(&state, &valid_obj, 10_000_001));
+        assert!(!position_matches_track(&state, &wrong_obj, 5_000_000));
     }
 }

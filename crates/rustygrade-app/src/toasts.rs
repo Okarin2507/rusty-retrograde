@@ -6,7 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iced::widget::canvas::{self, Canvas, Path, Stroke};
 use iced::widget::{column, container, float, row, space, text};
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Point, Rectangle, Renderer, Task, Theme, Vector, mouse};
+use iced::{
+    Alignment, Background, Border, Color, Element, Length, Padding, Point, Rectangle, Renderer,
+    Task, Theme, Vector, mouse,
+};
 
 use crate::controller::NoticeKind;
 use crate::theme;
@@ -30,30 +33,13 @@ struct Toast {
 /// Formats the current local time as `HH:MM:SS` without pulling in an external time crate.
 #[cfg(unix)]
 fn format_local_hms() -> String {
-    #[repr(C)]
-    #[derive(Default)]
-    struct Tm {
-        tm_sec: i32,
-        tm_min: i32,
-        tm_hour: i32,
-        tm_mday: i32,
-        tm_mon: i32,
-        tm_year: i32,
-        tm_wday: i32,
-        tm_yday: i32,
-        tm_isdst: i32,
-        tm_gmtoff: isize,
-        tm_zone: *const std::ffi::c_char,
-    }
-    unsafe extern "C" {
-        fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
-    }
     let Ok(dur) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return String::new();
     };
-    let secs = dur.as_secs() as i64;
-    let mut tm = Tm::default();
-    let ptr = unsafe { localtime_r(&raw const secs, &raw mut tm) };
+    let secs = dur.as_secs() as libc::time_t;
+    // SAFETY: `libc::tm` is a C POD struct zero-initialized and populated by `localtime_r`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ptr = unsafe { libc::localtime_r(&raw const secs, &raw mut tm) };
     if ptr.is_null() {
         String::new()
     } else {
@@ -89,7 +75,9 @@ impl Toasts {
             self.items.remove(0);
         }
         let secs = if kind == NoticeKind::Error { 6 } else { 3 };
-        Task::perform(tokio::time::sleep(Duration::from_secs(secs)), move |_| Message::ToastExpire(id))
+        Task::perform(tokio::time::sleep(Duration::from_secs(secs)), move |_| {
+            Message::ToastExpire(id)
+        })
     }
 
     /// Starts the slide-out; the toast leaves the list once it has played.
@@ -99,9 +87,14 @@ impl Toasts {
             self.remove(id);
             return Task::none();
         }
-        let Some(t) = self.items.iter_mut().find(|t| t.id == id) else { return Task::none() };
+        let Some(t) = self.items.iter_mut().find(|t| t.id == id) else {
+            return Task::none();
+        };
         t.exiting_since = Some(Instant::now());
-        Task::perform(tokio::time::sleep(Duration::from_millis(EXIT_MS as u64)), move |_| Message::ToastRemove(id))
+        Task::perform(
+            tokio::time::sleep(Duration::from_millis(EXIT_MS as u64)),
+            move |_| Message::ToastRemove(id),
+        )
     }
 
     pub fn remove(&mut self, id: u64) {
@@ -119,7 +112,8 @@ impl Toasts {
         }
         let now = Instant::now();
         self.items.iter().any(|t| {
-            t.exiting_since.is_some() || now.saturating_duration_since(t.born).as_secs_f32() * 1000.0 < ENTER_MS
+            t.exiting_since.is_some()
+                || now.saturating_duration_since(t.born).as_secs_f32() * 1000.0 < ENTER_MS
         })
     }
 }
@@ -160,22 +154,23 @@ fn kind_label(kind: NoticeKind) -> (&'static str, &'static str) {
     }
 }
 
-fn fade(c: Color, a: f32) -> Color {
-    Color { a: c.a * a, ..c }
-}
-
 /// Where a toast is in its slide: horizontal offset and opacity.
 fn slide(t: &Toast, now: Instant) -> (f32, f32) {
     if !crate::motion::enabled() {
         return (0.0, 1.0);
     }
     if let Some(since) = t.exiting_since {
-        let p = (now.saturating_duration_since(since).as_secs_f32() * 1000.0 / EXIT_MS).clamp(0.0, 1.0);
+        let p =
+            (now.saturating_duration_since(since).as_secs_f32() * 1000.0 / EXIT_MS).clamp(0.0, 1.0);
         let e = p * p * p;
         return (450.0 * e, 1.0 - e);
     }
-    let p = (now.saturating_duration_since(t.born).as_secs_f32() * 1000.0 / ENTER_MS).clamp(0.0, 1.0);
-    let e = 1.0 - (1.0 - p).powi(3);
+    let e = crate::motion::progress(
+        t.born,
+        now,
+        Duration::from_millis(ENTER_MS as u64),
+        crate::motion::Ease::CubicOut,
+    );
     (380.0 * (1.0 - e), e)
 }
 
@@ -183,40 +178,58 @@ fn toast_card<'a>(t: &'a Toast, now: Instant) -> Element<'a, Message> {
     let (dx, a) = slide(t, now);
     let accent = kind_color(t.kind);
     let (label, glyph) = kind_label(t.kind);
-    let line = container(space::horizontal()).width(Length::Fill).height(2).style(move |_t| container::Style {
-        background: Some(Background::Gradient(
-            iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
-                .add_stop(0.0, fade(accent, a))
-                .add_stop(1.0, Color::TRANSPARENT)
-                .into(),
-        )),
-        ..Default::default()
-    });
-    let icon = container(text(glyph).size(11).font(bold()).color(fade(accent, a)))
-        .width(20)
-        .height(20)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
+    let line = container(space::horizontal())
+        .width(Length::Fill)
+        .height(2)
         .style(move |_t| container::Style {
-            background: Some(Background::Color(fade(accent, 0.07 * a))),
-            border: Border { color: fade(accent, 0.27 * a), width: 1.0, radius: 0.0.into() },
+            background: Some(Background::Gradient(
+                iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
+                    .add_stop(0.0, theme::with_alpha(accent, accent.a * a))
+                    .add_stop(1.0, Color::TRANSPARENT)
+                    .into(),
+            )),
             ..Default::default()
         });
+    let icon = container(
+        text(glyph)
+            .size(11)
+            .font(bold())
+            .color(theme::with_alpha(accent, accent.a * a)),
+    )
+    .width(20)
+    .height(20)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .style(move |_t| container::Style {
+        background: Some(Background::Color(theme::with_alpha(
+            accent,
+            accent.a * 0.07 * a,
+        ))),
+        border: Border {
+            color: theme::with_alpha(accent, accent.a * 0.27 * a),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    });
     let body = row![
         icon,
         column![
             row![
-                text(label).size(10).font(bold()).color(fade(accent, a)),
+                text(label)
+                    .size(10)
+                    .font(bold())
+                    .color(theme::with_alpha(accent, accent.a * a)),
                 space::horizontal(),
                 text(&t.time_label)
                     .size(8)
-                    .color(fade(Color::from_rgb8(0x56, 0x55, 0x4F), a)),
+                    .color(theme::with_alpha(theme::TEXT_MUTE, a)),
             ]
             .align_y(Alignment::Center)
             .width(Length::Fill),
             text(crate::pages::fit(&t.text, 290.0, 11.0))
                 .size(11)
-                .color(fade(Color::from_rgb8(0xCF, 0xCC, 0xC4), a))
+                .color(theme::with_alpha(theme::TEXT_SOFT, a))
                 .wrapping(iced::widget::text::Wrapping::None),
         ]
         .spacing(2)
@@ -228,12 +241,18 @@ fn toast_card<'a>(t: &'a Toast, now: Instant) -> Element<'a, Message> {
     let card = container(column![line, body])
         .width(Length::Fill)
         .style(move |_t| container::Style {
-            background: Some(Background::Color(Color::from_rgba8(0x12, 0x12, 0x12, 0.95 * a))),
-            border: Border { color: fade(accent, 0.2 * a), width: 1.0, radius: 0.0.into() },
+            background: Some(Background::Color(theme::with_alpha(theme::PANEL, 0.95 * a))),
+            border: Border {
+                color: theme::with_alpha(accent, accent.a * 0.2 * a),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
             ..Default::default()
         });
     if dx > 0.5 {
-        float(card).translate(move |_b, _v| Vector::new(dx, 0.0)).into()
+        float(card)
+            .translate(move |_b, _v| Vector::new(dx, 0.0))
+            .into()
     } else {
         card.into()
     }
@@ -247,7 +266,14 @@ struct Spinner {
 impl<M> canvas::Program<M> for Spinner {
     type State = ();
 
-    fn draw(&self, _s: &(), renderer: &Renderer, _t: &Theme, bounds: Rectangle, _c: mouse::Cursor) -> Vec<canvas::Geometry> {
+    fn draw(
+        &self,
+        _s: &(),
+        renderer: &Renderer,
+        _t: &Theme,
+        bounds: Rectangle,
+        _c: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let c = Point::new(bounds.width / 2.0, bounds.height / 2.0);
         let start = self.turn * std::f32::consts::TAU;
@@ -259,7 +285,10 @@ impl<M> canvas::Program<M> for Spinner {
                 end_angle: iced::Radians(start + std::f32::consts::TAU * 0.75),
             });
         });
-        frame.stroke(&arc, Stroke::default().with_color(theme::TEAL).with_width(2.0));
+        frame.stroke(
+            &arc,
+            Stroke::default().with_color(theme::TEAL).with_width(2.0),
+        );
         vec![frame.into_geometry()]
     }
 }
@@ -282,15 +311,18 @@ fn scan_card<'a>(s: &ScanState) -> Element<'a, Message> {
     if s.total > 0 {
         let done = ((s.scanned as f32 / s.total as f32).clamp(0.0, 1.0) * 1000.0) as u16;
         let bar = row![
-            container(space::horizontal()).width(Length::FillPortion(done.max(1))).height(3).style(|_t| container::Style {
-                background: Some(Background::Gradient(
-                    iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
-                        .add_stop(0.0, theme::TEAL)
-                        .add_stop(1.0, theme::ORANGE)
-                        .into(),
-                )),
-                ..Default::default()
-            }),
+            container(space::horizontal())
+                .width(Length::FillPortion(done.max(1)))
+                .height(3)
+                .style(|_t| container::Style {
+                    background: Some(Background::Gradient(
+                        iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
+                            .add_stop(0.0, theme::TEAL)
+                            .add_stop(1.0, theme::ORANGE)
+                            .into(),
+                    )),
+                    ..Default::default()
+                }),
             container(space::horizontal())
                 .width(Length::FillPortion(1000 - done.clamp(1, 999)))
                 .height(3)
@@ -302,8 +334,12 @@ fn scan_card<'a>(s: &ScanState) -> Element<'a, Message> {
         .padding(16)
         .width(320)
         .style(|_t| container::Style {
-            background: Some(Background::Color(Color::from_rgba8(0x12, 0x12, 0x12, 0.95))),
-            border: Border { color: theme::LINE, width: 1.0, radius: 4.0.into() },
+            background: Some(Background::Color(theme::with_alpha(theme::PANEL, 0.95))),
+            border: Border {
+                color: theme::LINE,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
             ..Default::default()
         })
         .into()
@@ -317,25 +353,44 @@ pub fn layer(app: &App) -> Option<Element<'_, Message>> {
     let now = Instant::now();
     let mut col = column![].spacing(8).align_x(Alignment::End);
     if !app.toasts.items.is_empty() {
-        let cards: Vec<Element<'_, Message>> = app.toasts.items.iter().map(|t| toast_card(t, now)).collect();
+        let cards: Vec<Element<'_, Message>> = app
+            .toasts
+            .items
+            .iter()
+            .map(|t| toast_card(t, now))
+            .collect();
         col = col.push(container(column(cards).spacing(8)).width(360));
     }
     if let Some(s) = &app.scan {
         // scancard[IsVisible=True]: rises 20 px and fades in over 300 ms (cubic-out), over its own background.
         col = col.push(crate::motion::enter(
             "scancard",
-            crate::motion::EnterSpec::new(300, crate::motion::Ease::CubicOut, 20.0, crate::motion::Fade::Cover(Color::from_rgb8(0x12, 0x12, 0x12))),
+            crate::motion::EnterSpec::new(
+                300,
+                crate::motion::Ease::CubicOut,
+                20.0,
+                crate::motion::Fade::Cover(theme::PANEL),
+            ),
             scan_card(s),
         ));
     }
-    let right = if app.queue_open || app.audio_open { 364.0 } else { 24.0 };
+    let right = if app.queue_open || app.audio_open {
+        364.0
+    } else {
+        24.0
+    };
     Some(
         container(col)
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Alignment::End)
             .align_y(Alignment::End)
-            .padding(Padding { top: 0.0, right, bottom: 112.0, left: 0.0 })
+            .padding(Padding {
+                top: 0.0,
+                right,
+                bottom: 112.0,
+                left: 0.0,
+            })
             .into(),
     )
 }

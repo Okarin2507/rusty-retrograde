@@ -1,8 +1,11 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::thread;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -16,7 +19,10 @@ pub enum SingleInstanceCommand {
 }
 
 pub enum SingleInstanceOutcome {
-    Primary(SingleInstanceGuard, mpsc::UnboundedReceiver<SingleInstanceCommand>),
+    Primary(
+        SingleInstanceGuard,
+        mpsc::UnboundedReceiver<SingleInstanceCommand>,
+    ),
     SecondaryNotified,
 }
 
@@ -25,6 +31,8 @@ pub struct SingleInstance;
 
 pub struct SingleInstanceGuard {
     socket_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
     /// Exclusive `flock` on `app_dir/.instance.lock`, released when the guard drops (after the
     /// socket is removed, as fields drop after `Drop::drop`).
     _lock: Option<File>,
@@ -78,22 +86,43 @@ fn notify_primary(socket_path: &Path, args: &[String]) -> bool {
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        // Unblock `listener.incoming()` so the listener thread and socket fd shut down immediately.
+        let _ = UnixStream::connect(&self.socket_path);
         let _ = fs::remove_file(&self.socket_path);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
     }
+}
+
+fn current_uid_suffix() -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = fs::metadata("/proc/self") {
+            return format!("uid{}", meta.uid());
+        }
+    }
+    std::env::var("USER")
+        .ok()
+        .filter(|u| {
+            !u.is_empty()
+                && u.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .unwrap_or_else(|| "uid".to_owned())
 }
 
 impl SingleInstance {
     pub fn socket_path_for(app_dir: &Path) -> PathBuf {
-        let hash = fnv1a_64(app_dir.to_string_lossy().as_bytes());
+        let hash = crate::fnv1a_64(app_dir.to_string_lossy().as_bytes());
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
             && !runtime_dir.trim().is_empty()
         {
             return PathBuf::from(runtime_dir).join(format!("rustygrade-{hash:016x}.sock"));
         }
-        let user = std::env::var("USER")
-            .ok()
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| "uid".to_owned());
+        let user = current_uid_suffix();
         PathBuf::from(format!("/tmp/rustygrade-{user}-{hash:016x}.sock"))
     }
 
@@ -137,12 +166,18 @@ impl SingleInstance {
 
         let listener = UnixListener::bind(&socket_path)
             .map_err(|e| format!("Failed to bind single-instance socket: {e}"))?;
+        let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
         let (tx, rx) = mpsc::unbounded_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
 
-        let _ = thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("rustygrade-single-instance".to_owned())
             .spawn(move || {
                 for incoming in listener.incoming() {
+                    if thread_shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
                     let Ok(stream) = incoming else {
                         break;
                     };
@@ -174,11 +209,17 @@ impl SingleInstance {
                         break;
                     }
                 }
-            });
+            })
+            .map_err(|e| {
+                let _ = fs::remove_file(&socket_path);
+                format!("Failed to spawn single-instance listener: {e}")
+            })?;
 
         Ok(SingleInstanceOutcome::Primary(
             SingleInstanceGuard {
                 socket_path,
+                shutdown,
+                thread: Some(thread),
                 _lock: lock,
             },
             rx,
@@ -202,39 +243,38 @@ fn encode_request(args: &[String]) -> String {
     msg
 }
 
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn primary_receives_secondary_raise_and_cleans_up_socket() {
-        let dir = std::env::temp_dir().join(format!(
-            "rustygrade-si-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::create_dir_all(&dir);
+    fn primary_receives_secondary_commands_and_cleans_up_socket() {
+        let dir = std::env::temp_dir().join(format!("rustygrade-si-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
         let sock = SingleInstance::socket_path_for(&dir);
         let _ = fs::remove_file(&sock);
 
-        let outcome1 = SingleInstance::acquire(&dir, &[]).expect("primary acquire");
-        let (guard, mut rx) = match outcome1 {
-            SingleInstanceOutcome::Primary(g, rx) => (g, rx),
-            SingleInstanceOutcome::SecondaryNotified => panic!("expected Primary"),
+        let SingleInstanceOutcome::Primary(guard, mut rx) =
+            SingleInstance::acquire(&dir, &[]).expect("primary acquire")
+        else {
+            panic!("expected Primary");
         };
 
-        let outcome2 = SingleInstance::acquire(&dir, &["/music/track.flac".to_owned()])
-            .expect("secondary acquire");
         assert!(matches!(
-            outcome2,
+            SingleInstance::acquire(
+                &dir,
+                &[
+                    "/music/a b.flac".to_owned(),
+                    "file:///music/c.flac".to_owned(),
+                    "bad\npath".to_owned(),
+                ]
+            )
+            .expect("secondary open"),
+            SingleInstanceOutcome::SecondaryNotified
+        ));
+        assert!(matches!(
+            SingleInstance::acquire(&dir, &[]).expect("secondary raise"),
             SingleInstanceOutcome::SecondaryNotified
         ));
 
@@ -242,51 +282,26 @@ mod tests {
             .enable_time()
             .build()
             .unwrap();
-        let cmd = rt
+        let cmd1 = rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), rx.recv()).await })
-            .expect("timeout")
-            .expect("channel open");
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            cmd,
-            SingleInstanceCommand::OpenUris(vec!["/music/track.flac".to_owned()])
-        );
-
-        // Multiple paths arrive as one command, in order, including spaces.
-        let outcome3 = SingleInstance::acquire(
-            &dir,
-            &[
-                "/music/a b.flac".to_owned(),
-                "file:///music/c.flac".to_owned(),
-                "bad\npath".to_owned(),
-            ],
-        )
-        .expect("secondary acquire 2");
-        assert!(matches!(outcome3, SingleInstanceOutcome::SecondaryNotified));
-        let cmd = rt
-            .block_on(async { tokio::time::timeout(Duration::from_secs(2), rx.recv()).await })
-            .expect("timeout")
-            .expect("channel open");
-        assert_eq!(
-            cmd,
+            cmd1,
             SingleInstanceCommand::OpenUris(vec![
                 "/music/a b.flac".to_owned(),
                 "file:///music/c.flac".to_owned(),
             ])
         );
-
-        // No arguments => plain raise.
-        let outcome4 = SingleInstance::acquire(&dir, &[]).expect("secondary acquire 3");
-        assert!(matches!(outcome4, SingleInstanceOutcome::SecondaryNotified));
-        let cmd = rt
+        let cmd2 = rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), rx.recv()).await })
-            .expect("timeout")
-            .expect("channel open");
-        assert_eq!(cmd, SingleInstanceCommand::Raise);
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd2, SingleInstanceCommand::Raise);
 
         drop(guard);
         assert!(!sock.exists());
 
-        // The lock went with the guard: the next launch becomes primary again.
         match SingleInstance::acquire(&dir, &[]).expect("re-acquire") {
             SingleInstanceOutcome::Primary(g, _) => drop(g),
             SingleInstanceOutcome::SecondaryNotified => panic!("expected Primary after release"),

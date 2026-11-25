@@ -40,18 +40,26 @@ mod imp {
     fn icons() -> &'static Vec<ksni::Icon> {
         static ICONS: std::sync::OnceLock<Vec<ksni::Icon>> = std::sync::OnceLock::new();
         ICONS.get_or_init(|| {
-            let Ok(img) = image::load_from_memory(include_bytes!("../../../packaging/linux/rustygrade.png")) else {
+            let Ok(img) =
+                image::load_from_memory(include_bytes!("../../../packaging/linux/rustygrade.png"))
+            else {
                 return Vec::new();
             };
             [64u32, 32, 22]
                 .into_iter()
                 .map(|side| {
-                    let small = img.resize_exact(side, side, image::imageops::FilterType::Lanczos3).to_rgba8();
+                    let small = img
+                        .resize_exact(side, side, image::imageops::FilterType::Lanczos3)
+                        .to_rgba8();
                     let mut data = Vec::with_capacity((side * side * 4) as usize);
                     for px in small.pixels() {
                         data.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
                     }
-                    ksni::Icon { width: side as i32, height: side as i32, data }
+                    ksni::Icon {
+                        width: side as i32,
+                        height: side as i32,
+                        data,
+                    }
                 })
                 .collect()
         })

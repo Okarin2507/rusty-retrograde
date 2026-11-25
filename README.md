@@ -2,7 +2,7 @@
 
 # Rustygrade
 
-![Version](https://img.shields.io/badge/VERSION-1.0.1-4FD6BE?style=for-the-badge)
+![Version](https://img.shields.io/badge/VERSION-1.0.2-4FD6BE?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/PLATFORM-LINUX-E8C060?style=for-the-badge&logo=linux&logoColor=white)
 ![Rust](https://img.shields.io/badge/RUST-2024-FF6B35?style=for-the-badge&logo=rust&logoColor=white)
 
@@ -45,6 +45,7 @@ Gapless and bit-perfect playback on libmpv, PipeWire and ALSA, a fast library sc
 - **Albums and artists:** a grid for both, artist pages with most-played tracks and every album.
 - **Cover art:** embedded art or `cover` / `folder` / `front` images, cached as thumbnails plus full-size covers.
 - **Favorites and playlists:** Liked Songs, custom playlists with their own covers, hold-and-drag to reorder.
+- **Playlist import and export:** export a playlist as `.m3u8` or as a portable `.zip` with its cover (right-click → `EXPORT_M3U8` / `EXPORT_ZIP`), or back up every playlist, Liked Songs, smart playlist and play count with **Settings → EXPORT COLLECTIONS (.ZIP)**. `IMPORT_PLAYLIST` in the sidebar and **Settings → IMPORT PLAYLIST / BACKUP** read `.m3u`/`.m3u8` files and these ZIPs, including backups from the Android app; paths are matched to tracks in your library even when the music lives in another folder.
 - **Smart playlists:** rules over format, bit depth, sample rate, year, length, plays, last played, date added, favorite and text fields, matched on all or any, with an order and a limit.
 - **Tag editor:** edit title, artist, album, album artist, year, track/disc number and cover for a track or a whole album; changes are written into the files.
 - **Queue:** *Add to Queue*, *Play Next*, shuffle across the whole library, and session restore on the next start.
@@ -77,14 +78,25 @@ Gapless and bit-perfect playback on libmpv, PipeWire and ALSA, a fast library sc
 
 ```
 rustygrade/
-├── assets/                  # Icon and screenshots
+├── assets/                    # Screenshots
 ├── crates/
-│   ├── rustygrade-app/      # iced UI and the playback/library coordinator (binary: rustygrade)
-│   ├── rustygrade-audio/    # libmpv engine, direct ALSA output, PipeWire bridge
-│   ├── rustygrade-core/     # Library, scanner, covers, playlists, settings, session, lyrics
-│   └── rustygrade-linux/    # MPRIS, tray, portals, single instance, GPU policy
-├── packaging/linux/         # install.sh, package.sh, desktop entry, icon
-└── Cargo.toml               # Cargo workspace
+│   ├── rustygrade-app/        # iced UI and the coordinator (binary: rustygrade)
+│   │   └── src/
+│   │       ├── app/           # App state, update handlers, shortcuts, window handling
+│   │       ├── controller/    # Async coordinator: playback, audio output, library, playlists, tags, persistence
+│   │       ├── views/         # Sidebar, player bar, mini player, settings, tag and smart-playlist editors
+│   │       ├── pages/         # Library grid, album/artist/playlist pages, search
+│   │       ├── fullscreen/    # Full-screen player, reveal animation, lyrics
+│   │       ├── motion/        # Shared animation helpers
+│   │       ├── playback.rs    # Queue, shuffle, repeat, hand queue, play counting
+│   │       └── crossfade.rs   # Second engine and equal-power fades
+│   ├── rustygrade-audio/      # libmpv engine (mpv_engine/), direct ALSA output and mixer, PipeWire bridge
+│   ├── rustygrade-core/       # Models and JSON stores, scanner/, covers/, playlist_io/ (M3U8, ZIP),
+│   │                          # zip_archive/, smart playlists, lyrics, tag writer, folder watcher
+│   └── rustygrade-linux/      # MPRIS, tray, portals, single instance, GPU policy, Discord RPC,
+│                              # online artwork lookup (artwork_lookup/)
+├── packaging/linux/           # install.sh, package.sh, desktop entry, icon
+└── Cargo.toml                 # Cargo workspace
 ```
 
 ---
@@ -127,6 +139,15 @@ packaging/linux/install.sh uninstall
 To build a distributable tarball instead: `packaging/linux/package.sh` → `dist/rustygrade-<version>-linux-<arch>.tar.gz`, which contains its own `install.sh`.
 
 To just try it without installing: `cargo run --release -p rustygrade-app`.
+
+### Development
+
+```bash
+cargo test --workspace                        # unit tests; never touch ~/.rustygrade
+cargo clippy --workspace --all-targets        # also run with --all-features and --no-default-features
+```
+
+The default features are `pipewire-bridge`, `tray` and `portal`; `--no-default-features` builds without libpipewire, the tray and the XDG portals. Tests that need real audio hardware are `#[ignore]`d. A release build takes a few minutes (fat LTO), and `target/` grows to tens of GB over time; `cargo clean` frees it.
 
 ---
 
@@ -193,11 +214,12 @@ Everything lives in `~/.rustygrade`:
 | `library.json` | Tracks and albums |
 | `native-settings.json` | Settings |
 | `native-collections.json` | Playlists and smart playlists |
-| `native-session.json`, `native-queue.json` | Restored queue and playback position |
+| `native-session.json`, `native-queue.json`, `native-queue-original.json` | Restored queue (and its order before shuffle) and playback position |
 | `native-stats.json` | Play counts and history |
 | `covers/` | Thumbnails and full-size covers |
+| `discord-art-cache.json` | Cached online artwork lookups for Discord Rich Presence |
 
-Damaged library and playlist files are restored from their `.bak` copies. Errors are logged to `~/.rustygrade/native-error.log`.
+The library, playlists, settings and stats keep a `.bak` copy. A file that is damaged **or missing** is restored from it, so to reset one (for example the settings), delete both the file and its `.bak`. Errors are logged to `~/.rustygrade/native-error.log`.
 
 ### Environment variables
 
